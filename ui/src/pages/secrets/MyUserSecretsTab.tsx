@@ -135,7 +135,7 @@ function MyUserSecretRow({
       )}
     >
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
           <span className="font-medium text-foreground">{definition.name}</span>
           <code className="rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
             {definition.key}
