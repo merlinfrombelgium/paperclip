@@ -420,6 +420,52 @@ describeEmbeddedPostgres("secretService", () => {
         responsibleUserId: "user-2",
       }),
     ).rejects.toThrow(/not configured/i);
+    await expect(
+      svc.collectMissingRuntimeBindings(companyId, env, {
+        consumerType: "agent",
+        consumerId: "agent-1",
+        responsibleUserId: "user-2",
+      }),
+    ).resolves.toEqual([
+      expect.objectContaining({
+        bindingType: "user_secret_ref",
+        configPath: "env.GITHUB_TOKEN",
+        envKey: "GITHUB_TOKEN",
+        userSecretDefinitionId: definition.id,
+        userSecretDefinitionKey: "github_token",
+        responsibleUserId: "user-2",
+        errorCode: "user_secret_missing",
+      }),
+    ]);
+
+    const optionalEnv = {
+      OPTIONAL_GITHUB_TOKEN: {
+        type: "user_secret_ref" as const,
+        key: "github_token",
+        version: "latest" as const,
+        required: false,
+      },
+    };
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-optional" }, optionalEnv);
+    await expect(
+      svc.collectMissingRuntimeBindings(companyId, optionalEnv, {
+        consumerType: "agent",
+        consumerId: "agent-optional",
+        responsibleUserId: "user-2",
+      }),
+    ).resolves.toEqual([]);
+    await expect(
+      svc.resolveEnvBindings(companyId, optionalEnv, {
+        consumerType: "agent",
+        consumerId: "agent-optional",
+        actorType: "agent",
+        actorId: "agent-optional",
+        responsibleUserId: "user-2",
+      }),
+    ).resolves.toMatchObject({
+      env: {},
+      manifest: [],
+    });
 
     const resolved = await svc.resolveEnvBindings(companyId, env, {
       consumerType: "agent",

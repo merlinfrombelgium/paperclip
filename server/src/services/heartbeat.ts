@@ -441,9 +441,19 @@ type RuntimeConfigSecretResolver = Pick<
 >;
 
 function formatMissingBindingForOperator(missing: MissingRuntimeBinding): string {
+  if (missing.bindingType === "user_secret_ref") {
+    const definitionLabel =
+      missing.userSecretDefinitionName
+        ? `"${missing.userSecretDefinitionName}"`
+        : missing.userSecretDefinitionKey
+          ? `"${missing.userSecretDefinitionKey}"`
+          : "declared user secret";
+    const ownerLabel = missing.responsibleUserId ? ` for responsible user ${missing.responsibleUserId}` : "";
+    return `user secret ${definitionLabel}${ownerLabel} not available at ${missing.consumerType} ${missing.configPath}`;
+  }
   const secretLabel = missing.secretName
     ? `"${missing.secretName}"`
-    : missing.secretId;
+    : missing.secretId ?? "unknown";
   return `secret ${secretLabel} not bound at ${missing.consumerType} ${missing.configPath}`;
 }
 
@@ -589,7 +599,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
         ...(await input.secretsSvc.collectMissingRuntimeBindings(
           input.companyId,
           environmentEnv,
-          { consumerType: "environment", consumerId: input.environmentId },
+          {
+            consumerType: "environment",
+            consumerId: input.environmentId,
+            responsibleUserId: input.responsibleUserId ?? null,
+          },
         )),
       );
     }
@@ -598,7 +612,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
         ...(await input.secretsSvc.collectMissingRuntimeBindings(
           input.companyId,
           parseObject(executionRunConfig.env),
-          { consumerType: "agent", consumerId: input.agentId },
+          {
+            consumerType: "agent",
+            consumerId: input.agentId,
+            responsibleUserId: input.responsibleUserId ?? null,
+          },
         )),
       );
       if (typeof input.secretsSvc.collectMissingAdapterConfigRuntimeBindings === "function") {
@@ -607,7 +625,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
             input.companyId,
             executionRunConfig,
             input.adapterType ?? null,
-            { consumerType: "agent", consumerId: input.agentId },
+            {
+              consumerType: "agent",
+              consumerId: input.agentId,
+              responsibleUserId: input.responsibleUserId ?? null,
+            },
           )),
         );
       }
@@ -617,7 +639,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
         ...(await input.secretsSvc.collectMissingRuntimeBindings(
           input.companyId,
           projectEnv,
-          { consumerType: "project", consumerId: input.projectId },
+          {
+            consumerType: "project",
+            consumerId: input.projectId,
+            responsibleUserId: input.responsibleUserId ?? null,
+          },
         )),
       );
     }
@@ -626,7 +652,11 @@ export async function resolveExecutionRunAdapterConfig(input: {
         ...(await input.secretsSvc.collectMissingRuntimeBindings(
           input.companyId,
           routineEnv,
-          { consumerType: "routine", consumerId: input.routineId },
+          {
+            consumerType: "routine",
+            consumerId: input.routineId,
+            responsibleUserId: input.responsibleUserId ?? null,
+          },
         )),
       );
     }
@@ -4737,6 +4767,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        parentId: issues.parentId,
+        createdByUserId: issues.createdByUserId,
+        responsibleUserId: issues.responsibleUserId,
         originKind: issues.originKind,
         originId: issues.originId,
         originRunId: issues.originRunId,
@@ -4752,13 +4785,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null,
   ) {
     if (!issueContext || issueContext.originKind !== "routine_execution" || !issueContext.originId) {
-      return { routineId: null, env: null };
+      return { routineId: null, env: null, responsibleUserId: null };
     }
 
     const routineRun = issueContext.originRunId
       ? await db
           .select({
             routineRevisionId: routineRuns.routineRevisionId,
+            responsibleUserId: routineRuns.responsibleUserId,
           })
           .from(routineRuns)
           .where(
@@ -4775,6 +4809,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const revision = await db
         .select({
           snapshot: routineRevisions.snapshot,
+          responsibleUserId: routineRevisions.responsibleUserId,
         })
         .from(routineRevisions)
         .where(
@@ -4787,16 +4822,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .then((rows) => rows[0] ?? null);
       const snapshot = revision?.snapshot as RoutineRevisionSnapshotV1 | undefined;
       if (snapshot?.version === 1) {
-        return { routineId: issueContext.originId, env: snapshot.routine.env ?? null };
+        return {
+          routineId: issueContext.originId,
+          env: snapshot.routine.env ?? null,
+          responsibleUserId: revision?.responsibleUserId ?? snapshot.routine.responsibleUserId ?? null,
+        };
       }
     }
 
     const routine = await db
-      .select({ env: routines.env })
+      .select({ env: routines.env, responsibleUserId: routines.responsibleUserId })
       .from(routines)
       .where(and(eq(routines.id, issueContext.originId), eq(routines.companyId, companyId)))
       .then((rows) => rows[0] ?? null);
-    return { routineId: issueContext.originId, env: routine?.env ?? null };
+    return {
+      routineId: issueContext.originId,
+      env: routine?.env ?? null,
+      responsibleUserId: routineRun?.responsibleUserId ?? routine?.responsibleUserId ?? null,
+    };
+  }
+
+  async function resolveResponsibleUserIdForRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    contextSnapshot: Record<string, unknown>;
+    issueContext: Awaited<ReturnType<typeof getIssueExecutionContext>> | null;
+    routineEnvContext: Awaited<ReturnType<typeof getRoutineEnvForExecutionIssue>>;
+  }) {
+    const contextResponsibleUserId = readNonEmptyString(input.contextSnapshot.responsibleUserId);
+    if (contextResponsibleUserId) return contextResponsibleUserId;
+    if (input.run.responsibleUserId) return input.run.responsibleUserId;
+    if (input.routineEnvContext.responsibleUserId) return input.routineEnvContext.responsibleUserId;
+    if (input.issueContext?.responsibleUserId) return input.issueContext.responsibleUserId;
+    if (input.issueContext?.createdByUserId) return input.issueContext.createdByUserId;
+    if (input.issueContext?.parentId) {
+      const parent = await db
+        .select({
+          responsibleUserId: issues.responsibleUserId,
+          createdByUserId: issues.createdByUserId,
+        })
+        .from(issues)
+        .where(and(eq(issues.companyId, input.run.companyId), eq(issues.id, input.issueContext.parentId)))
+        .then((rows) => rows[0] ?? null);
+      return parent?.responsibleUserId ?? parent?.createdByUserId ?? null;
+    }
+    return null;
   }
 
   async function getRuntimeState(agentId: string) {
@@ -8567,10 +8636,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     const claimedAt = new Date();
+    const responsibleUserId = await resolveResponsibleUserIdForRun({
+      run,
+      contextSnapshot: context,
+      issueContext: issueId ? await getIssueExecutionContext(run.companyId, issueId) : null,
+      routineEnvContext: { routineId: null, env: null, responsibleUserId: null },
+    });
     const claimed = await db
       .update(heartbeatRuns)
       .set({
         status: "running",
+        responsibleUserId,
         startedAt: run.startedAt ?? claimedAt,
         updatedAt: claimedAt,
       })
@@ -9661,6 +9737,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context.acceptedPlanWakeRouting;
     }
     const routineEnvContext = await getRoutineEnvForExecutionIssue(agent.companyId, issueContext);
+    const responsibleUserId = await resolveResponsibleUserIdForRun({
+      run,
+      contextSnapshot: context,
+      issueContext,
+      routineEnvContext,
+    });
+    if (responsibleUserId && run.responsibleUserId !== responsibleUserId) {
+      await db
+        .update(heartbeatRuns)
+        .set({ responsibleUserId, updatedAt: new Date() })
+        .where(eq(heartbeatRuns.id, run.id));
+      run = { ...run, responsibleUserId };
+    }
+    if (responsibleUserId && issueContext && !issueContext.responsibleUserId) {
+      await db
+        .update(issues)
+        .set({ responsibleUserId, updatedAt: new Date() })
+        .where(and(eq(issues.companyId, agent.companyId), eq(issues.id, issueContext.id), isNull(issues.responsibleUserId)));
+      issueContext = { ...issueContext, responsibleUserId };
+    }
     const projectExecutionWorkspacePolicy = gateProjectExecutionWorkspacePolicy(
       parseProjectExecutionWorkspacePolicy(projectContext?.executionWorkspacePolicy),
       isolatedWorkspacesEnabled,
@@ -9969,6 +10065,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       environmentEnv: selectedEnvironmentForConfig?.envVars ?? null,
       projectId: projectContext?.id ?? null,
       routineId: routineEnvContext.routineId,
+      responsibleUserId,
       executionRunConfig,
       projectEnv: projectContext?.env ?? null,
       routineEnv: routineEnvContext.env,
@@ -12599,6 +12696,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (projectId && !readNonEmptyString(enrichedContextSnapshot.projectId)) {
       enrichedContextSnapshot.projectId = projectId;
     }
+    const queuedResponsibleUserId =
+      readNonEmptyString(enrichedContextSnapshot.responsibleUserId) ??
+      (opts.requestedByActorType === "user" ? opts.requestedByActorId ?? null : null);
 
     const budgetBlock = await budgets.getInvocationBlock(agent.companyId, agentId, {
       issueId,
@@ -13185,6 +13285,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             invocationSource: source,
             triggerDetail,
             status: "queued",
+            responsibleUserId: queuedResponsibleUserId,
             wakeupRequestId: wakeupRequest.id,
             contextSnapshot: enrichedContextSnapshot,
             sessionIdBefore: sessionBefore,
@@ -13250,7 +13351,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       Boolean(sameScopeRunningRun) &&
       !sameScopeQueuedRun &&
       shouldQueueFollowupForRunningIssueWake({ contextSnapshot: enrichedContextSnapshot, wakeCommentId });
-
     const rawCoalescedTarget =
       sameScopeQueuedRun ??
       sameScopeScheduledRetryRun ??
@@ -13359,6 +13459,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           invocationSource: source,
           triggerDetail,
           status: "queued",
+          responsibleUserId: queuedResponsibleUserId,
           wakeupRequestId: wakeupRequest.id,
           contextSnapshot: enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,

@@ -5273,6 +5273,7 @@ export function issueRoutes(
       ...(sourceTrust ? { sourceTrust } : {}),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      actorRunId: actor.runId,
       watchdogActorRunId: actor.runId,
     });
     await issueReferencesSvc.syncIssue(issue.id);
@@ -5441,6 +5442,7 @@ export function issueRoutes(
       ...(sourceTrust ? { sourceTrust } : {}),
       createdByAgentId: actor.agentId,
       createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+      actorRunId: actor.runId,
       actorAgentId: actor.agentId,
       actorUserId: actor.actorType === "user" ? actor.actorId : null,
       watchdogActorRunId: actor.runId,
@@ -5606,6 +5608,7 @@ export function issueRoutes(
         ...(sourceTrust ? { sourceTrust } : {}),
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
+        actorRunId: actor.runId,
         actorAgentId: actor.agentId,
         actorUserId: actor.actorType === "user" ? actor.actorId : null,
       });
