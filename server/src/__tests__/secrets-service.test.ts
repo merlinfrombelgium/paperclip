@@ -346,6 +346,56 @@ describeEmbeddedPostgres("secretService", () => {
     expect(resolved.manifest[0]?.bindingId).toBe(binding!.id);
   });
 
+  it("denies user secret resolution outside the low-trust declaration allowlist", async () => {
+    const companyId = await seedCompany();
+    await seedCompanyMember(companyId, "user-1", "owner");
+    const svc = secretService(db);
+    const definition = await svc.createUserSecretDefinition(companyId, {
+      key: "github_token",
+      name: "GitHub token",
+      provider: "local_encrypted",
+    });
+    const env = {
+      GITHUB_TOKEN: { type: "user_secret_ref" as const, key: "github_token", version: "latest" as const },
+    };
+
+    await svc.syncEnvBindingsForTarget(companyId, { targetType: "agent", targetId: "agent-1" }, env);
+    await svc.createCurrentUserSecretValue(companyId, "user-1", {
+      definitionKey: "github_token",
+      value: "user-one-secret",
+    });
+    const [declaration] = await db
+      .select()
+      .from(userSecretDeclarations)
+      .where(eq(userSecretDeclarations.userSecretDefinitionId, definition.id));
+    expect(declaration?.id).toBeTruthy();
+
+    await expect(
+      svc.resolveEnvBindings(companyId, env, {
+        consumerType: "agent",
+        consumerId: "agent-1",
+        actorType: "agent",
+        actorId: "agent-1",
+        responsibleUserId: "user-1",
+        allowedBindingIds: ["11111111-1111-4111-8111-111111111111"],
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      details: { code: "binding_not_allowed" },
+    });
+
+    const resolved = await svc.resolveEnvBindings(companyId, env, {
+      consumerType: "agent",
+      consumerId: "agent-1",
+      actorType: "agent",
+      actorId: "agent-1",
+      responsibleUserId: "user-1",
+      allowedBindingIds: [declaration!.id],
+    });
+    expect(resolved.env.GITHUB_TOKEN).toBe("user-one-secret");
+    expect(resolved.manifest[0]?.bindingId).toBe(declaration!.id);
+  });
+
   it("resolves routine env secret refs through routine bindings and records value-free access metadata", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

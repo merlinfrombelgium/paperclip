@@ -2262,8 +2262,9 @@ export function secretService(db: Db) {
           code: "responsible_user_missing",
         });
       }
+      let declaration: typeof userSecretDeclarations.$inferSelect | null = null;
       if (context?.configPath) {
-        const declaration = await db
+        declaration = await db
           .select()
           .from(userSecretDeclarations)
           .where(and(
@@ -2281,6 +2282,15 @@ export function secretService(db: Db) {
           );
         }
       }
+      if (
+        Array.isArray(context?.allowedBindingIds) &&
+        (!declaration || !context.allowedBindingIds.includes(declaration.id))
+      ) {
+        throw unprocessable(
+          "User secret declaration is outside the active low-trust boundary",
+          { code: "binding_not_allowed" },
+        );
+      }
       const secret = await getUserSecretValue({
         companyId,
         ownerUserId: responsibleUserId,
@@ -2294,7 +2304,7 @@ export function secretService(db: Db) {
           responsibleUserId,
         });
       }
-      return await resolveSecretValueInternal(
+      const resolution = await resolveSecretValueInternal(
         companyId,
         secret.id,
         input.version ?? "latest",
@@ -2303,6 +2313,13 @@ export function secretService(db: Db) {
           allowUserSecretScope: true,
         },
       );
+      return {
+        ...resolution,
+        manifestEntry: {
+          ...resolution.manifestEntry,
+          bindingId: declaration?.id ?? resolution.manifestEntry.bindingId ?? null,
+        },
+      };
     },
 
     previewRemoteImport: async (
