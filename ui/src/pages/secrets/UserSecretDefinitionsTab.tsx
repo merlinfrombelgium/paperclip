@@ -107,14 +107,17 @@ export function UserSecretDefinitionsTab({ companyId }: { companyId: string }) {
         name: form.name.trim(),
         description: form.description.trim() || null,
         usageGuidance: form.usageGuidance.trim() || null,
-        status: form.status,
       };
       if (editing) {
-        return secretsApi.updateUserSecretDefinition(companyId, editing.id, sharedPayload);
+        return secretsApi.updateUserSecretDefinition(companyId, editing.id, {
+          ...sharedPayload,
+          status: form.status,
+        });
       }
       return secretsApi.createUserSecretDefinition(companyId, {
         ...sharedPayload,
         key: form.key.trim(),
+        status: form.status === "deleted" ? "active" : form.status,
       });
     },
     onSuccess: (definition) => {

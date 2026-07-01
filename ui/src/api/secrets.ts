@@ -32,7 +32,7 @@ export interface CreateUserSecretDefinitionInput {
   key: string;
   name: string;
   description?: string | null;
-  status?: SecretStatus;
+  status?: Exclude<SecretStatus, "deleted">;
   provider?: SecretProvider;
   managedMode?: SecretManagedMode;
   providerConfigId?: string | null;
@@ -41,7 +41,6 @@ export interface CreateUserSecretDefinitionInput {
 }
 
 export interface UpdateUserSecretDefinitionInput {
-  key?: string;
   name?: string;
   description?: string | null;
   status?: SecretStatus;

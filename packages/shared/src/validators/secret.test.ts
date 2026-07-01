@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  createUserSecretDefinitionSchema,
   createUserSecretDeclarationSchema,
   createUserSecretValueSchema,
   createSecretProviderConfigSchema,
@@ -61,6 +62,16 @@ describe("secret validators", () => {
     ).toEqual({
       name: "Renamed",
     });
+  });
+
+  it("does not allow user secret definitions to be created as deleted", () => {
+    expect(() =>
+      createUserSecretDefinitionSchema.parse({
+        key: "github_api_token",
+        name: "GitHub API token",
+        status: "deleted",
+      }),
+    ).toThrow();
   });
 
   it("requires secret rotation payloads to include rotation input", () => {

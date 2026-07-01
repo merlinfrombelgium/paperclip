@@ -9,6 +9,7 @@ import {
 
 const secretKeySchema = z.string().trim().min(1).max(120).regex(/^[a-zA-Z0-9_.-]+$/);
 const secretVersionSelectorSchema = z.union([z.literal("latest"), z.number().int().positive()]);
+const creatableSecretStatusSchema = z.enum(["active", "disabled", "archived"]);
 
 export const envBindingPlainSchema = z.object({
   type: z.literal("plain"),
@@ -142,7 +143,7 @@ export const createUserSecretDefinitionSchema = z.object({
   key: secretKeySchema,
   name: z.string().trim().min(1).max(160),
   description: z.string().trim().max(500).optional().nullable(),
-  status: z.enum(SECRET_STATUSES).optional(),
+  status: creatableSecretStatusSchema.optional(),
   provider: z.enum(SECRET_PROVIDERS).optional(),
   providerConfigId: z.string().uuid().optional().nullable(),
   managedMode: z.enum(SECRET_MANAGED_MODES).optional(),
