@@ -471,6 +471,7 @@ export {
   updateUserSecretDefinitionSchema,
   createUserSecretValueSchema,
   updateUserSecretValueSchema,
+  rotateUserSecretValueSchema,
   createUserSecretDeclarationSchema,
   createSecretProviderConfigSchema,
   updateSecretProviderConfigSchema,
