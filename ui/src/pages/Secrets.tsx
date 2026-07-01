@@ -23,6 +23,9 @@ import {
   X,
   Filter,
   Info,
+  Pencil,
+  UserRound,
+  Users,
 } from "lucide-react";
 import { Link } from "react-router-dom";
 import type {
@@ -37,6 +40,8 @@ import type {
   SecretProviderConfigStatus,
   SecretProviderDescriptor,
   SecretStatus,
+  UserSecretCoverageSummary,
+  UserSecretDefinition,
 } from "@paperclipai/shared";
 import { useCompany } from "../context/CompanyContext";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
@@ -78,10 +83,21 @@ import { cn } from "../lib/utils";
 import { PageTabBar } from "../components/PageTabBar";
 import { ImportFromVaultDialog } from "./secrets/ImportFromVaultDialog";
 import { MyUserSecretsTab } from "./secrets/MyUserSecretsTab";
-import { UserSecretDefinitionsTab } from "./secrets/UserSecretDefinitionsTab";
+import { SetMyUserSecretDialog } from "./secrets/SetMyUserSecretDialog";
+import {
+  coverageSummaryLabel,
+  UserSecretChip,
+} from "./secrets/user-secret-presentation";
+import type { MyUserSecretEntry } from "../api/secrets";
 
 type CreateMode = "managed" | "external";
-type SecretsTab = "secrets" | "user-definitions" | "my-secrets" | "vaults";
+type SecretValueProvider = "company" | "user";
+type ProvidedByFilter = "all" | SecretValueProvider;
+type SecretsTab = "secrets" | "my-secrets" | "vaults";
+
+type UnifiedSecretRow =
+  | { id: string; kind: "company"; secret: CompanySecret }
+  | { id: string; kind: "user"; definition: UserSecretDefinition };
 
 type ProviderVaultForm = {
   provider: SecretProvider;
@@ -248,6 +264,15 @@ function normalizeSecretKeyForPreview(input: string) {
     .slice(0, 120);
 }
 
+function normalizeUserSecretKeyForPreview(input: string) {
+  return input
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 120);
+}
+
 
 function modeLabel(managedMode: SecretManagedMode) {
   return managedMode === "paperclip_managed" ? "Paperclip-managed" : "Linked external";
@@ -405,17 +430,23 @@ export function Secrets() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<SecretStatus | "all">("active");
   const [providerFilter, setProviderFilter] = useState<SecretProvider | "all">("all");
+  const [providedByFilter, setProvidedByFilter] = useState<ProvidedByFilter>("all");
   const [selectedSecretId, setSelectedSecretId] = useState<string | null>(null);
+  const [selectedDefinitionId, setSelectedDefinitionId] = useState<string | null>(null);
   const [usageDialogSecretId, setUsageDialogSecretId] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [importOpen, setImportOpen] = useState(false);
   const [importInitialVaultId, setImportInitialVaultId] = useState<string | null>(null);
+  const [secretValueProvider, setSecretValueProvider] = useState<SecretValueProvider>("company");
   const [createMode, setCreateMode] = useState<CreateMode>("managed");
+  const [editingDefinition, setEditingDefinition] = useState<UserSecretDefinition | null>(null);
+  const [createKeyDirty, setCreateKeyDirty] = useState(false);
   const [createForm, setCreateForm] = useState({
     name: "",
     key: "",
     value: "",
     description: "",
+    usageGuidance: "",
     externalRef: "",
     provider: "local_encrypted" as SecretProvider,
     providerConfigId: "",
@@ -427,6 +458,8 @@ export function Secrets() {
   const [rotateProviderConfigId, setRotateProviderConfigId] = useState("");
   const [rotateError, setRotateError] = useState<string | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<CompanySecret | null>(null);
+  const [definitionDeleteConfirm, setDefinitionDeleteConfirm] = useState<UserSecretDefinition | null>(null);
+  const [setMyValueFor, setSetMyValueFor] = useState<MyUserSecretEntry | null>(null);
   const [vaultDialogOpen, setVaultDialogOpen] = useState(false);
   const [editingVault, setEditingVault] = useState<CompanySecretProviderConfig | null>(null);
   const [removeVaultConfirm, setRemoveVaultConfirm] = useState<CompanySecretProviderConfig | null>(null);
@@ -445,6 +478,22 @@ export function Secrets() {
       ? queryKeys.secrets.list(selectedCompanyId)
       : ["secrets", "__disabled__"],
     queryFn: () => secretsApi.list(selectedCompanyId!),
+    enabled: Boolean(selectedCompanyId),
+  });
+
+  const userDefinitionsQuery = useQuery({
+    queryKey: selectedCompanyId
+      ? queryKeys.secrets.userDefinitions(selectedCompanyId)
+      : ["user-secret-definitions", "__disabled__"],
+    queryFn: () => secretsApi.listUserSecretDefinitions(selectedCompanyId!),
+    enabled: Boolean(selectedCompanyId),
+  });
+
+  const myUserSecretsQuery = useQuery({
+    queryKey: selectedCompanyId
+      ? queryKeys.secrets.myUserSecrets(selectedCompanyId)
+      : ["my-user-secrets", "__disabled__"],
+    queryFn: () => secretsApi.listMyUserSecrets(selectedCompanyId!),
     enabled: Boolean(selectedCompanyId),
   });
 
@@ -477,12 +526,25 @@ export function Secrets() {
   });
 
   const secrets = secretsQuery.data ?? [];
+  const userDefinitions = userDefinitionsQuery.data ?? [];
+  const myUserSecrets = myUserSecretsQuery.data ?? [];
   const providers = providersQuery.data ?? [];
   const providerConfigs = providerConfigsQuery.data ?? [];
   const selectedSecret = useMemo(
     () => secrets.find((secret) => secret.id === selectedSecretId) ?? null,
     [secrets, selectedSecretId],
   );
+  const selectedDefinition = useMemo(
+    () => userDefinitions.find((definition) => definition.id === selectedDefinitionId) ?? null,
+    [selectedDefinitionId, userDefinitions],
+  );
+  const selectedDefinitionMyEntry = useMemo(() => {
+    if (!selectedDefinition) return null;
+    return myUserSecrets.find((entry) => entry.definition.id === selectedDefinition.id) ?? {
+      definition: selectedDefinition,
+      secret: null,
+    };
+  }, [myUserSecrets, selectedDefinition]);
   const usageDialogSecret = useMemo(
     () => secrets.find((secret) => secret.id === usageDialogSecretId) ?? null,
     [secrets, usageDialogSecretId],
@@ -524,21 +586,49 @@ export function Secrets() {
     secretKeySource: createForm.key.trim() || createForm.name,
   });
 
-  const filtered = useMemo(() => {
+  const unifiedRows = useMemo<UnifiedSecretRow[]>(
+    () => [
+      ...secrets.map((secret) => ({ id: `company:${secret.id}`, kind: "company" as const, secret })),
+      ...userDefinitions.map((definition) => ({
+        id: `user:${definition.id}`,
+        kind: "user" as const,
+        definition,
+      })),
+    ],
+    [secrets, userDefinitions],
+  );
+
+  const filteredRows = useMemo(() => {
     const needle = search.trim().toLowerCase();
-    return secrets.filter((secret) => {
-      if (statusFilter !== "all" && secret.status !== statusFilter) return false;
-      if (providerFilter !== "all" && secret.provider !== providerFilter) return false;
+    return unifiedRows.filter((row) => {
+      const providedBy: SecretValueProvider = row.kind === "company" ? "company" : "user";
+      const status = row.kind === "company" ? row.secret.status : row.definition.status;
+      if (providedByFilter !== "all" && providedBy !== providedByFilter) return false;
+      if (statusFilter !== "all" && status !== statusFilter) return false;
+      if (providerFilter !== "all" && row.kind === "company" && row.secret.provider !== providerFilter) {
+        return false;
+      }
       if (!needle) return true;
+      if (row.kind === "company") {
+        return (
+          row.secret.name.toLowerCase().includes(needle) ||
+          row.secret.key.toLowerCase().includes(needle) ||
+          (row.secret.description?.toLowerCase().includes(needle) ?? false) ||
+          (row.secret.externalRef?.toLowerCase().includes(needle) ?? false)
+        );
+      }
       return (
-        secret.name.toLowerCase().includes(needle) ||
-        secret.key.toLowerCase().includes(needle) ||
-        (secret.description?.toLowerCase().includes(needle) ?? false) ||
-        (secret.externalRef?.toLowerCase().includes(needle) ?? false)
+        row.definition.name.toLowerCase().includes(needle) ||
+        row.definition.key.toLowerCase().includes(needle) ||
+        (row.definition.description?.toLowerCase().includes(needle) ?? false) ||
+        (row.definition.usageGuidance?.toLowerCase().includes(needle) ?? false)
       );
     });
-  }, [secrets, search, statusFilter, providerFilter]);
-  const activeSecretFilterCount = (statusFilter === "active" ? 0 : 1) + (providerFilter === "all" ? 0 : 1);
+  }, [providedByFilter, providerFilter, search, statusFilter, unifiedRows]);
+  const activeSecretFilterCount =
+    (statusFilter === "active" ? 0 : 1) +
+    (providerFilter === "all" ? 0 : 1) +
+    (providedByFilter === "all" ? 0 : 1);
 
   const usageQuery = useQuery({
     queryKey: selectedSecret ? queryKeys.secrets.usage(selectedSecret.id) : ["secrets", "usage", "__disabled__"],
@@ -564,15 +654,78 @@ export function Secrets() {
   function invalidateAll(extraIds: string[] = []) {
     if (!selectedCompanyId) return;
     queryClient.invalidateQueries({ queryKey: queryKeys.secrets.list(selectedCompanyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.secrets.userDefinitions(selectedCompanyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.secrets.myUserSecrets(selectedCompanyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.secrets.providerConfigs(selectedCompanyId) });
     for (const id of extraIds) {
       queryClient.invalidateQueries({ queryKey: queryKeys.secrets.usage(id) });
       queryClient.invalidateQueries({ queryKey: queryKeys.secrets.accessEvents(id) });
+      queryClient.invalidateQueries({ queryKey: queryKeys.secrets.userDefinitionCoverage(selectedCompanyId, id) });
     }
   }
 
+  function openCreateSecret() {
+    setEditingDefinition(null);
+    setSecretValueProvider("company");
+    setCreateMode("managed");
+    setCreateKeyDirty(false);
+    setCreateError(null);
+    setCreateForm({
+      name: "",
+      key: "",
+      value: "",
+      description: "",
+      usageGuidance: "",
+      externalRef: "",
+      provider: "local_encrypted",
+      providerConfigId: getDefaultProviderConfigId(providerConfigs, "local_encrypted"),
+    });
+    setCreateOpen(true);
+  }
+
+  function openEditDefinition(definition: UserSecretDefinition) {
+    setEditingDefinition(definition);
+    setSecretValueProvider("user");
+    setCreateMode("managed");
+    setCreateKeyDirty(true);
+    setCreateError(null);
+    setCreateForm({
+      name: definition.name,
+      key: definition.key,
+      value: "",
+      description: definition.description ?? "",
+      usageGuidance: definition.usageGuidance ?? "",
+      externalRef: "",
+      provider: "local_encrypted",
+      providerConfigId: "",
+    });
+    setCreateOpen(true);
+  }
+
   const createMutation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
+      const sharedDefinitionPayload = {
+        name: createForm.name.trim(),
+        description: createForm.description.trim() || null,
+        usageGuidance: createForm.usageGuidance.trim() || null,
+      };
+      if (editingDefinition) {
+        const definition = await secretsApi.updateUserSecretDefinition(
+          selectedCompanyId!,
+          editingDefinition.id,
+          sharedDefinitionPayload,
+        );
+        return { kind: "user" as const, item: definition, action: "updated" as const };
+      }
+      if (secretValueProvider === "user") {
+        const definition = await secretsApi.createUserSecretDefinition(selectedCompanyId!, {
+          ...sharedDefinitionPayload,
+          key: createForm.key.trim(),
+          status: "active",
+        });
+        return { kind: "user" as const, item: definition, action: "created" as const };
+      }
+
       const input: CreateSecretInput = {
         name: createForm.name.trim(),
         provider: createForm.provider,
@@ -586,23 +739,44 @@ export function Secrets() {
       } else {
         input.externalRef = createForm.externalRef.trim();
       }
-      return secretsApi.create(selectedCompanyId!, input);
+      const secret = await secretsApi.create(selectedCompanyId!, input);
+      return { kind: "company" as const, item: secret, action: "created" as const };
     },
-    onSuccess: (created) => {
-      pushToast({ title: "Secret created", body: created.name, tone: "success" });
+    onSuccess: (result) => {
+      pushToast({
+        title:
+          result.kind === "company"
+            ? "Secret created"
+            : result.action === "updated"
+              ? "User-provided secret updated"
+              : "User-provided secret created",
+        body: result.item.name,
+        tone: "success",
+      });
       setCreateOpen(false);
+      setEditingDefinition(null);
+      setSecretValueProvider("company");
+      setCreateKeyDirty(false);
       setCreateForm({
         name: "",
         key: "",
         value: "",
         description: "",
+        usageGuidance: "",
         externalRef: "",
         provider: createForm.provider,
         providerConfigId: getDefaultProviderConfigId(providerConfigs, createForm.provider),
       });
       setCreateError(null);
-      setSelectedSecretId(created.id);
-      invalidateAll([created.id]);
+      if (result.kind === "company") {
+        setSelectedSecretId(result.item.id);
+        setSelectedDefinitionId(null);
+        invalidateAll([result.item.id]);
+      } else {
+        setSelectedDefinitionId(result.item.id);
+        setSelectedSecretId(null);
+        invalidateAll([result.item.id]);
+      }
     },
     onError: (error) => {
       setCreateError(error instanceof ApiError ? error.message : (error as Error).message);
@@ -663,6 +837,22 @@ export function Secrets() {
     },
   });
 
+  const definitionStatusMutation = useMutation({
+    mutationFn: ({ definition, status }: { definition: UserSecretDefinition; status: SecretStatus }) =>
+      secretsApi.updateUserSecretDefinition(selectedCompanyId!, definition.id, { status }),
+    onSuccess: (updated) => {
+      pushToast({ title: `User-provided secret ${updated.status}`, body: updated.name, tone: "info" });
+      invalidateAll([updated.id]);
+    },
+    onError: (error) => {
+      pushToast({
+        title: "Status update failed",
+        body: error instanceof Error ? error.message : "Try again",
+        tone: "error",
+      });
+    },
+  });
+
   const deleteMutation = useMutation({
     mutationFn: (id: string) => secretsApi.remove(id),
     onSuccess: (_response, id) => {
@@ -670,6 +860,24 @@ export function Secrets() {
       setDeleteConfirm(null);
       if (selectedSecretId === id) setSelectedSecretId(null);
       invalidateAll([id]);
+    },
+    onError: (error) => {
+      pushToast({
+        title: "Delete failed",
+        body: error instanceof Error ? error.message : "Try again",
+        tone: "error",
+      });
+    },
+  });
+
+  const deleteDefinitionMutation = useMutation({
+    mutationFn: (definition: UserSecretDefinition) =>
+      secretsApi.removeUserSecretDefinition(selectedCompanyId!, definition.id),
+    onSuccess: (_response, definition) => {
+      pushToast({ title: "User-provided secret removed", body: definition.name, tone: "info" });
+      setDefinitionDeleteConfirm(null);
+      if (selectedDefinitionId === definition.id) setSelectedDefinitionId(null);
+      invalidateAll([definition.id]);
     },
     onError: (error) => {
       pushToast({
@@ -888,8 +1096,7 @@ export function Secrets() {
       >
         <PageTabBar
           items={[
-            { value: "secrets", label: "Company secrets" },
-            { value: "user-definitions", label: "User secret definitions" },
+            { value: "secrets", label: "Secrets" },
             { value: "my-secrets", label: "My secrets" },
             { value: "vaults", label: "Provider vaults" },
           ]}
@@ -915,10 +1122,12 @@ export function Secrets() {
             <SecretsFiltersPopover
               statusFilter={statusFilter}
               providerFilter={providerFilter}
+              providedByFilter={providedByFilter}
               providers={providers}
               activeFilterCount={activeSecretFilterCount}
               onStatusChange={setStatusFilter}
               onProviderChange={setProviderFilter}
+              onProvidedByChange={setProvidedByFilter}
             />
             <ImportFromVaultButton
               providerConfigs={providerConfigs}
@@ -926,38 +1135,46 @@ export function Secrets() {
               onManageVaults={() => setActiveTab("vaults")}
               className="ml-auto"
             />
-            <Button onClick={() => setCreateOpen(true)} size="sm">
+            <Button onClick={openCreateSecret} size="sm">
               <Plus className="h-3.5 w-3.5 mr-1" /> New secret
             </Button>
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto">
-            {secretsQuery.isError ? (
+            {secretsQuery.isError || userDefinitionsQuery.isError ? (
               <div className="text-sm text-destructive flex items-center gap-2 py-4">
                 <AlertCircle className="h-4 w-4" /> Failed to load secrets:{" "}
-                {(secretsQuery.error as Error).message}
-                <Button variant="ghost" size="sm" onClick={() => secretsQuery.refetch()}>
+                {((secretsQuery.error ?? userDefinitionsQuery.error) as Error).message}
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    void secretsQuery.refetch();
+                    void userDefinitionsQuery.refetch();
+                  }}
+                >
                   Retry
                 </Button>
               </div>
-            ) : secrets.length === 0 && !secretsQuery.isPending ? (
+            ) : unifiedRows.length === 0 && !secretsQuery.isPending && !userDefinitionsQuery.isPending ? (
               <EmptyState
                 icon={KeyRound}
-                message="No secrets yet. Create your first managed secret or link an external reference."
+                message="No secrets yet. Create a shared company secret or one that each user supplies."
                 action="New secret"
-                onAction={() => setCreateOpen(true)}
+                onAction={openCreateSecret}
               />
-            ) : filtered.length === 0 ? (
+            ) : filteredRows.length === 0 ? (
               <EmptyState icon={Search} message="No secrets match your filters." />
             ) : (
               <table className="w-full text-sm">
               <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
                 <tr>
                   <th className="px-3 py-2 text-left font-medium">Name</th>
+                  <th className="px-2 py-2 text-left font-medium">Provided by</th>
                   <th className="px-2 py-2 text-left font-medium">Mode</th>
                   <th className="px-2 py-2 text-left font-medium">Provider</th>
                   <th className="px-2 py-2 text-left font-medium">Status</th>
-                  <th className="px-2 py-2 text-left font-medium">Version</th>
-                  <th className="px-2 py-2 text-left font-medium">Last rotated</th>
+                  <th className="px-2 py-2 text-left font-medium">Coverage / version</th>
+                  <th className="px-2 py-2 text-left font-medium">Last updated</th>
                   <th className="px-2 py-2 text-left font-medium">Last resolved</th>
                   <th className="px-2 py-2 text-left font-medium">References</th>
                   <th className="px-2 py-2 text-left font-medium">Reference</th>
@@ -965,55 +1182,98 @@ export function Secrets() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((secret) => (
+                {filteredRows.map((row) => (
                   <tr
-                    key={secret.id}
+                    key={row.id}
                     className={cn(
                       "border-b border-border/60 hover:bg-accent/40 cursor-pointer",
-                      selectedSecretId === secret.id && "bg-accent/60",
+                      row.kind === "company" && selectedSecretId === row.secret.id && "bg-accent/60",
+                      row.kind === "user" && selectedDefinitionId === row.definition.id && "bg-accent/60",
                     )}
-                    onClick={() => setSelectedSecretId(secret.id)}
+                    onClick={() => {
+                      setSecretDetailTab("details");
+                      if (row.kind === "company") {
+                        setSelectedSecretId(row.secret.id);
+                        setSelectedDefinitionId(null);
+                      } else {
+                        setSelectedDefinitionId(row.definition.id);
+                        setSelectedSecretId(null);
+                      }
+                    }}
                   >
                     <td className="px-3 py-2.5">
-                      <div className="font-medium text-foreground">{secret.name}</div>
-                    </td>
-                    <td className="px-2 py-2.5 text-xs text-muted-foreground">
-                      {modeLabel(secret.managedMode)}
-                    </td>
-                    <td className="px-2 py-2.5 text-xs">
-                      <div>{providerLabel(providers, secret.provider)}</div>
+                      <div className="font-medium text-foreground">
+                        {row.kind === "company" ? row.secret.name : row.definition.name}
+                      </div>
+                      <code className="mt-0.5 block text-[11px] text-muted-foreground">
+                        {row.kind === "company" ? row.secret.key : row.definition.key}
+                      </code>
                     </td>
                     <td className="px-2 py-2.5">
-                      <span className={cn("text-xs font-medium", statusTextTone(secret.status))}>
-                        {secret.status}
+                      {row.kind === "company" ? (
+                        <Badge variant="outline" className="text-[11px]">
+                          Company
+                        </Badge>
+                      ) : (
+                        <UserSecretChip label="Each user" />
+                      )}
+                    </td>
+                    <td className="px-2 py-2.5 text-xs text-muted-foreground">
+                      {row.kind === "company" ? modeLabel(row.secret.managedMode) : "Personal value"}
+                    </td>
+                    <td className="px-2 py-2.5 text-xs">
+                      <div>
+                        {row.kind === "company" ? providerLabel(providers, row.secret.provider) : "—"}
+                      </div>
+                    </td>
+                    <td className="px-2 py-2.5">
+                      <span
+                        className={cn(
+                          "text-xs font-medium",
+                          statusTextTone(row.kind === "company" ? row.secret.status : row.definition.status),
+                        )}
+                      >
+                        {row.kind === "company" ? row.secret.status : row.definition.status}
                       </span>
                     </td>
-                    <td className="px-2 py-2.5 text-xs font-mono">v{secret.latestVersion}</td>
-                    <td className="px-2 py-2.5 text-xs text-muted-foreground">
-                      {formatRelative(secret.lastRotatedAt)}
+                    <td className="px-2 py-2.5 text-xs">
+                      {row.kind === "company" ? (
+                        <span className="font-mono">v{row.secret.latestVersion}</span>
+                      ) : (
+                        <CoverageInline companyId={selectedCompanyId} definitionId={row.definition.id} />
+                      )}
                     </td>
                     <td className="px-2 py-2.5 text-xs text-muted-foreground">
-                      {formatRelative(secret.lastResolvedAt)}
+                      {formatRelative(row.kind === "company" ? row.secret.lastRotatedAt : row.definition.updatedAt)}
+                    </td>
+                    <td className="px-2 py-2.5 text-xs text-muted-foreground">
+                      {row.kind === "company" ? formatRelative(row.secret.lastResolvedAt) : "—"}
                     </td>
                     <td className="px-2 py-2.5 text-xs">
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-7 px-2 text-xs"
-                        aria-label={`View references for ${secret.name}`}
-                        onClick={(event) => {
-                          event.stopPropagation();
-                          setUsageDialogSecretId(secret.id);
-                        }}
-                      >
-                        {secret.referenceCount ?? 0}
-                      </Button>
+                      {row.kind === "company" ? (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          aria-label={`View references for ${row.secret.name}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setUsageDialogSecretId(row.secret.id);
+                          }}
+                        >
+                          {row.secret.referenceCount ?? 0}
+                        </Button>
+                      ) : (
+                        <span className="text-muted-foreground">Env key</span>
+                      )}
                     </td>
                     <td className="px-2 py-2.5 text-xs">
-                      {secret.managedMode === "external_reference" ? (
+                      {row.kind === "user" ? (
+                        <span className="text-muted-foreground">Each member stores their own value</span>
+                      ) : row.secret.managedMode === "external_reference" ? (
                         <span className="inline-flex items-center gap-1 font-mono text-muted-foreground">
                           <Link2 className="h-3 w-3" />
-                          {secret.externalRef ?? "—"}
+                          {row.secret.externalRef ?? "—"}
                         </span>
                       ) : (
                         <span className="text-muted-foreground">Owned</span>
@@ -1025,7 +1285,14 @@ export function Secrets() {
                         size="sm"
                         onClick={(event) => {
                           event.stopPropagation();
-                          setSelectedSecretId(secret.id);
+                          setSecretDetailTab("details");
+                          if (row.kind === "company") {
+                            setSelectedSecretId(row.secret.id);
+                            setSelectedDefinitionId(null);
+                          } else {
+                            setSelectedDefinitionId(row.definition.id);
+                            setSelectedSecretId(null);
+                          }
                         }}
                       >
                         Open
@@ -1037,12 +1304,6 @@ export function Secrets() {
               </table>
             )}
           </div>
-        </TabsContent>
-        <TabsContent
-          value="user-definitions"
-          className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden"
-        >
-          <UserSecretDefinitionsTab companyId={selectedCompanyId} />
         </TabsContent>
         <TabsContent
           value="my-secrets"
@@ -1075,7 +1336,15 @@ export function Secrets() {
         </TabsContent>
       </Tabs>
 
-      <Sheet open={Boolean(selectedSecret)} onOpenChange={(open) => !open && setSelectedSecretId(null)}>
+      <Sheet
+        open={Boolean(selectedSecret || selectedDefinition)}
+        onOpenChange={(open) => {
+          if (!open) {
+            setSelectedSecretId(null);
+            setSelectedDefinitionId(null);
+          }
+        }}
+      >
         <SheetContent className="w-full sm:max-w-xl flex flex-col gap-0">
           {selectedSecret ? (
             <>
@@ -1186,6 +1455,137 @@ export function Secrets() {
                 </div>
               </Tabs>
             </>
+          ) : selectedDefinition ? (
+            <>
+              <SheetHeader>
+                <SheetTitle className="flex items-center gap-2 text-base">
+                  <UserRound className="h-4 w-4" />
+                  {selectedDefinition.name}
+                  <span className={cn("ml-2 text-sm font-normal", statusTextTone(selectedDefinition.status))}>
+                    {selectedDefinition.status}
+                  </span>
+                </SheetTitle>
+                <SheetDescription>
+                  Each user · <span className="font-mono">{selectedDefinition.key}</span>
+                </SheetDescription>
+              </SheetHeader>
+              <div className="flex flex-wrap gap-2 px-4 pb-2">
+                <Button
+                  size="sm"
+                  variant={selectedDefinitionMyEntry?.secret ? "outline" : "default"}
+                  onClick={() =>
+                    setSetMyValueFor(
+                      selectedDefinitionMyEntry ?? { definition: selectedDefinition, secret: null },
+                    )
+                  }
+                  disabled={selectedDefinition.status !== "active"}
+                >
+                  <KeyRound className="h-3.5 w-3.5 mr-1" />
+                  {selectedDefinitionMyEntry?.secret ? "Update my value" : "Set my value"}
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => openEditDefinition(selectedDefinition)}>
+                  <Pencil className="h-3.5 w-3.5 mr-1" /> Edit
+                </Button>
+                {selectedDefinition.status === "active" ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      definitionStatusMutation.mutate({
+                        definition: selectedDefinition,
+                        status: "disabled",
+                      })
+                    }
+                    disabled={definitionStatusMutation.isPending}
+                  >
+                    <Ban className="h-3.5 w-3.5 mr-1" /> Disable
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      definitionStatusMutation.mutate({
+                        definition: selectedDefinition,
+                        status: "active",
+                      })
+                    }
+                    disabled={definitionStatusMutation.isPending}
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5 mr-1" /> Activate
+                  </Button>
+                )}
+                {selectedDefinition.status === "archived" ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      definitionStatusMutation.mutate({
+                        definition: selectedDefinition,
+                        status: "active",
+                      })
+                    }
+                    disabled={definitionStatusMutation.isPending}
+                  >
+                    <ArchiveRestore className="h-3.5 w-3.5 mr-1" /> Unarchive
+                  </Button>
+                ) : (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() =>
+                      definitionStatusMutation.mutate({
+                        definition: selectedDefinition,
+                        status: "archived",
+                      })
+                    }
+                    disabled={definitionStatusMutation.isPending}
+                  >
+                    <Archive className="h-3.5 w-3.5 mr-1" /> Archive
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="text-destructive hover:text-destructive"
+                  onClick={() => setDefinitionDeleteConfirm(selectedDefinition)}
+                >
+                  <Trash2 className="h-3.5 w-3.5 mr-1" /> Delete
+                </Button>
+              </div>
+              <Tabs value={secretDetailTab} onValueChange={setSecretDetailTab} className="flex-1 min-h-0 flex flex-col">
+                <div className="border-b border-border px-4">
+                  <PageTabBar
+                    items={[
+                      { value: "details", label: "Details" },
+                      { value: "coverage", label: "Coverage" },
+                      { value: "usage", label: "Usage" },
+                      { value: "events", label: "Access events" },
+                    ]}
+                    align="start"
+                    value={secretDetailTab}
+                    onValueChange={setSecretDetailTab}
+                  />
+                </div>
+                <div className="flex-1 min-h-0 overflow-y-auto px-4 py-3">
+                  <TabsContent value="details">
+                    <UserSecretDetailsTab definition={selectedDefinition} />
+                  </TabsContent>
+                  <TabsContent value="coverage">
+                    <UserSecretCoverageTab
+                      companyId={selectedCompanyId}
+                      definitionId={selectedDefinition.id}
+                    />
+                  </TabsContent>
+                  <TabsContent value="usage">
+                    <UserSecretUsageTab definition={selectedDefinition} />
+                  </TabsContent>
+                  <TabsContent value="events">
+                    <UserSecretAccessEventsTab />
+                  </TabsContent>
+                </div>
+              </Tabs>
+            </>
           ) : null}
         </SheetContent>
       </Sheet>
@@ -1237,18 +1637,11 @@ export function Secrets() {
       <Dialog open={createOpen} onOpenChange={setCreateOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>Create secret</DialogTitle>
+            <DialogTitle>{editingDefinition ? "Edit user-provided secret" : "Create secret"}</DialogTitle>
             <DialogDescription>
-              Choose whether Paperclip should own future provider writes, or only resolve an existing
-              provider reference at runtime.
+              Choose who provides the value. Shared fields keep their values when you switch modes.
             </DialogDescription>
           </DialogHeader>
-          <Tabs value={createMode} onValueChange={(value) => setCreateMode(value as CreateMode)}>
-            <TabsList className="w-full grid grid-cols-2">
-              <TabsTrigger value="managed">Managed value</TabsTrigger>
-              <TabsTrigger value="external">External reference</TabsTrigger>
-            </TabsList>
-          </Tabs>
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-3">
               <div>
@@ -1256,102 +1649,172 @@ export function Secrets() {
                 <Input
                   id="new-secret-name"
                   value={createForm.name}
-                  onChange={(event) =>
-                    setCreateForm((current) => ({ ...current, name: event.target.value }))
-                  }
-                  placeholder="OPENAI_API_KEY"
+                  onChange={(event) => {
+                    const name = event.target.value;
+                    setCreateForm((current) => ({
+                      ...current,
+                      name,
+                      key: createKeyDirty
+                        ? current.key
+                        : secretValueProvider === "user"
+                          ? normalizeUserSecretKeyForPreview(name)
+                          : normalizeSecretKeyForPreview(name),
+                    }));
+                  }}
+                  placeholder={secretValueProvider === "user" ? "Personal GitHub token" : "OPENAI_API_KEY"}
                   autoFocus
                 />
               </div>
               <div>
                 <label className="text-xs font-medium" htmlFor="new-secret-key">
-                  Key <span className="text-muted-foreground/70">(optional)</span>
+                  Key {secretValueProvider === "company" ? <span className="text-muted-foreground/70">(optional)</span> : null}
                 </label>
                 <Input
                   id="new-secret-key"
                   value={createForm.key}
-                  onChange={(event) =>
-                    setCreateForm((current) => ({ ...current, key: event.target.value }))
-                  }
-                  placeholder="auto from name"
+                  onChange={(event) => {
+                    setCreateKeyDirty(true);
+                    setCreateForm((current) => ({ ...current, key: event.target.value }));
+                  }}
+                  placeholder={secretValueProvider === "user" ? "PERSONAL_GH_TOKEN" : "auto from name"}
+                  disabled={Boolean(editingDefinition)}
+                  className={secretValueProvider === "user" ? "font-mono text-sm" : undefined}
                 />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  {secretValueProvider === "user"
+                    ? editingDefinition
+                      ? "Stable env binding key. Cannot be changed."
+                      : "Env-style key used by user-secret bindings."
+                    : "Shared secret keys keep lowercase dash normalization."}
+                </p>
               </div>
             </div>
             <div>
-              <label className="text-xs font-medium" htmlFor="new-secret-provider">Provider</label>
-              <select
-                id="new-secret-provider"
-                className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm outline-none"
-                value={createForm.provider}
+              <label className="text-xs font-medium" htmlFor="new-secret-description">
+                Description <span className="text-muted-foreground/70">(optional)</span>
+              </label>
+              <Input
+                id="new-secret-description"
+                value={createForm.description}
                 onChange={(event) =>
-                  setCreateForm((current) => {
-                    const provider = event.target.value as SecretProvider;
-                    return {
+                  setCreateForm((current) => ({ ...current, description: event.target.value }))
+                }
+                placeholder="What is this secret used for? (no values)"
+              />
+            </div>
+
+            {!editingDefinition ? (
+              <div className="space-y-1">
+                <p className="text-xs font-medium text-foreground">Who provides the value?</p>
+                <Tabs
+                  value={secretValueProvider}
+                  onValueChange={(value) => {
+                    const next = value as SecretValueProvider;
+                    setSecretValueProvider(next);
+                    setCreateForm((current) => ({
                       ...current,
-                      provider,
-                      providerConfigId: getDefaultProviderConfigId(providerConfigs, provider),
-                    };
-                  })
-                }
-              >
-                {providers.map((provider) => (
-                  <option
-                    key={provider.id}
-                    value={provider.id}
-                    disabled={Boolean(
-                      getCreateProviderBlockReason(provider, createMode, providerHealthQuery.data ?? null),
-                    )}
-                  >
-                    {provider.label}
-                    {provider.configured === false
-                      ? " (not configured)"
-                      : provider.requiresExternalRef
-                        ? " (external only)"
-                        : ""}
-                  </option>
-                ))}
-              </select>
-              {createProviderBlockReason ? (
-                <p className="mt-1 flex items-center gap-1 text-[11px] text-destructive">
-                  <AlertCircle className="h-3 w-3" />
-                  {createProviderBlockReason}
+                      key: createKeyDirty
+                        ? current.key
+                        : next === "user"
+                          ? normalizeUserSecretKeyForPreview(current.name)
+                          : normalizeSecretKeyForPreview(current.name),
+                    }));
+                  }}
+                >
+                  <TabsList className="grid w-full grid-cols-2">
+                    <TabsTrigger value="company">Company</TabsTrigger>
+                    <TabsTrigger value="user">Each user</TabsTrigger>
+                  </TabsList>
+                </Tabs>
+                <p className="text-[11px] text-muted-foreground">
+                  Company stores one shared value. Each user lets every member supply their own value under My secrets.
                 </p>
-              ) : createProviderHealthText ? (
-                <p className="mt-1 text-[11px] text-muted-foreground">{createProviderHealthText}</p>
-              ) : null}
-            </div>
-            <div>
-              <label className="text-xs font-medium" htmlFor="new-secret-vault">Provider vault</label>
-              <select
-                id="new-secret-vault"
-                className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm outline-none"
-                value={createForm.providerConfigId}
-                onChange={(event) =>
-                  setCreateForm((current) => ({ ...current, providerConfigId: event.target.value }))
-                }
-              >
-                <option value="">Deployment default</option>
-                {createProviderConfigs.map((config) => {
-                  const blockReason = getProviderConfigBlockReason(config);
-                  return (
-                    <option key={config.id} value={config.id} disabled={Boolean(blockReason)}>
-                      {config.displayName}
-                      {config.isDefault ? " (default)" : ""}
-                      {blockReason ? ` (${blockReason})` : ""}
-                    </option>
-                  );
-                })}
-              </select>
-              {selectedCreateProviderConfig ? (
-                <ProviderVaultInlineWarning config={selectedCreateProviderConfig} />
-              ) : (
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  Existing deployment-level provider settings stay available for backwards compatibility.
-                </p>
-              )}
-            </div>
-            {createMode === "managed" ? (
+              </div>
+            ) : null}
+
+            {secretValueProvider === "company" ? (
               <>
+                <Tabs value={createMode} onValueChange={(value) => setCreateMode(value as CreateMode)}>
+                  <TabsList className="w-full grid grid-cols-2">
+                    <TabsTrigger value="managed">Managed value</TabsTrigger>
+                    <TabsTrigger value="external">External reference</TabsTrigger>
+                  </TabsList>
+                </Tabs>
+                <div>
+                  <label className="text-xs font-medium" htmlFor="new-secret-provider">Provider</label>
+                  <select
+                    id="new-secret-provider"
+                    className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm outline-none"
+                    value={createForm.provider}
+                    onChange={(event) =>
+                      setCreateForm((current) => {
+                        const provider = event.target.value as SecretProvider;
+                        return {
+                          ...current,
+                          provider,
+                          providerConfigId: getDefaultProviderConfigId(providerConfigs, provider),
+                        };
+                      })
+                    }
+                  >
+                    {providers.map((provider) => (
+                      <option
+                        key={provider.id}
+                        value={provider.id}
+                        disabled={Boolean(
+                          getCreateProviderBlockReason(provider, createMode, providerHealthQuery.data ?? null),
+                        )}
+                      >
+                        {provider.label}
+                        {provider.configured === false
+                          ? " (not configured)"
+                          : provider.requiresExternalRef
+                            ? " (external only)"
+                            : ""}
+                      </option>
+                    ))}
+                  </select>
+                  {createProviderBlockReason ? (
+                    <p className="mt-1 flex items-center gap-1 text-[11px] text-destructive">
+                      <AlertCircle className="h-3 w-3" />
+                      {createProviderBlockReason}
+                    </p>
+                  ) : createProviderHealthText ? (
+                    <p className="mt-1 text-[11px] text-muted-foreground">{createProviderHealthText}</p>
+                  ) : null}
+                </div>
+                <div>
+                  <label className="text-xs font-medium" htmlFor="new-secret-vault">Provider vault</label>
+                  <select
+                    id="new-secret-vault"
+                    className="h-9 w-full rounded-md border border-border bg-background px-2 text-sm outline-none"
+                    value={createForm.providerConfigId}
+                    onChange={(event) =>
+                      setCreateForm((current) => ({ ...current, providerConfigId: event.target.value }))
+                    }
+                  >
+                    <option value="">Deployment default</option>
+                    {createProviderConfigs.map((config) => {
+                      const blockReason = getProviderConfigBlockReason(config);
+                      return (
+                        <option key={config.id} value={config.id} disabled={Boolean(blockReason)}>
+                          {config.displayName}
+                          {config.isDefault ? " (default)" : ""}
+                          {blockReason ? ` (${blockReason})` : ""}
+                        </option>
+                      );
+                    })}
+                  </select>
+                  {selectedCreateProviderConfig ? (
+                    <ProviderVaultInlineWarning config={selectedCreateProviderConfig} />
+                  ) : (
+                    <p className="mt-1 text-[11px] text-muted-foreground">
+                      Existing deployment-level provider settings stay available for backwards compatibility.
+                    </p>
+                  )}
+                </div>
+                {createMode === "managed" ? (
+                  <>
                 <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-2 text-[11px] text-emerald-700 dark:text-emerald-300">
                   Paperclip-managed secrets are created in the selected provider and future rotations
                   write a new provider version through Paperclip.
@@ -1377,38 +1840,48 @@ export function Secrets() {
                     placeholder="Stored once, never re-displayed"
                   />
                 </div>
+                  </>
+                ) : (
+                  <div>
+                    <label className="text-xs font-medium" htmlFor="new-secret-ref">External reference</label>
+                    <Input
+                      id="new-secret-ref"
+                      value={createForm.externalRef}
+                      onChange={(event) =>
+                        setCreateForm((current) => ({ ...current, externalRef: event.target.value }))
+                      }
+                      placeholder="arn:aws:secretsmanager:..."
+                      className="font-mono text-xs"
+                    />
+                    <p className="text-[11px] text-muted-foreground mt-1">
+                      Existing provider secrets are resolve-only in Paperclip. Rotate the value in the provider,
+                      then update this reference only if the path, ARN, or version changes.
+                    </p>
+                  </div>
+                )}
               </>
             ) : (
-              <div>
-                <label className="text-xs font-medium" htmlFor="new-secret-ref">External reference</label>
-                <Input
-                  id="new-secret-ref"
-                  value={createForm.externalRef}
-                  onChange={(event) =>
-                    setCreateForm((current) => ({ ...current, externalRef: event.target.value }))
-                  }
-                  placeholder="arn:aws:secretsmanager:..."
-                  className="font-mono text-xs"
-                />
-                <p className="text-[11px] text-muted-foreground mt-1">
-                  Existing provider secrets are resolve-only in Paperclip. Rotate the value in the provider,
-                  then update this reference only if the path, ARN, or version changes.
-                </p>
-              </div>
+              <>
+                <div className="rounded-md border border-violet-500/30 bg-violet-500/5 p-2 text-[11px] text-violet-800 dark:text-violet-200">
+                  Every member supplies their own value under My secrets. Agents resolve the responsible
+                  user&apos;s value at runtime.
+                </div>
+                <div className="space-y-1">
+                  <label className="text-xs font-medium text-foreground" htmlFor="new-secret-usage-guidance">
+                    Usage guidance <span className="text-muted-foreground/70">(optional)</span>
+                  </label>
+                  <Textarea
+                    id="new-secret-usage-guidance"
+                    value={createForm.usageGuidance}
+                    onChange={(event) =>
+                      setCreateForm((current) => ({ ...current, usageGuidance: event.target.value }))
+                    }
+                    placeholder="Tell members how to create their token, required scopes, etc."
+                    className="min-h-[70px] text-sm"
+                  />
+                </div>
+              </>
             )}
-            <div>
-              <label className="text-xs font-medium" htmlFor="new-secret-description">
-                Description <span className="text-muted-foreground/70">(optional)</span>
-              </label>
-              <Input
-                id="new-secret-description"
-                value={createForm.description}
-                onChange={(event) =>
-                  setCreateForm((current) => ({ ...current, description: event.target.value }))
-                }
-                placeholder="What is this secret used for? (no values)"
-              />
-            </div>
             {createError ? <p className="text-xs text-destructive">{createError}</p> : null}
           </div>
           <DialogFooter>
@@ -1422,13 +1895,21 @@ export function Secrets() {
               }}
               disabled={
                 createMutation.isPending ||
-                Boolean(createProviderBlockReason) ||
                 !createForm.name.trim() ||
-                (createMode === "managed" ? !createForm.value : !createForm.externalRef.trim())
+                (secretValueProvider === "user"
+                  ? !createForm.key.trim()
+                  : Boolean(createProviderBlockReason) ||
+                    (createMode === "managed" ? !createForm.value : !createForm.externalRef.trim()))
               }
             >
               {createMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : null}
-              {createMode === "managed" ? "Create secret" : "Link reference"}
+              {editingDefinition
+                ? "Save changes"
+                : secretValueProvider === "user"
+                  ? "Create user-provided secret"
+                  : createMode === "managed"
+                    ? "Create secret"
+                    : "Link reference"}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -1677,6 +2158,44 @@ export function Secrets() {
         </DialogContent>
       </Dialog>
 
+      <Dialog
+        open={Boolean(definitionDeleteConfirm)}
+        onOpenChange={(open) => !open && setDefinitionDeleteConfirm(null)}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete user-provided secret</DialogTitle>
+            <DialogDescription>
+              Permanently removes <strong>{definitionDeleteConfirm?.name}</strong> for the whole company.
+              Existing member values become unreferenced and active bindings must be remapped.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDefinitionDeleteConfirm(null)}>Cancel</Button>
+            <Button
+              variant="destructive"
+              onClick={() =>
+                definitionDeleteConfirm && deleteDefinitionMutation.mutate(definitionDeleteConfirm)
+              }
+              disabled={deleteDefinitionMutation.isPending}
+            >
+              {deleteDefinitionMutation.isPending ? <Loader2 className="h-3.5 w-3.5 animate-spin mr-1" /> : null}
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <SetMyUserSecretDialog
+        companyId={selectedCompanyId}
+        definition={setMyValueFor?.definition ?? null}
+        existingSecret={setMyValueFor?.secret ?? null}
+        open={setMyValueFor !== null}
+        onOpenChange={(open) => {
+          if (!open) setSetMyValueFor(null);
+        }}
+      />
+
       <Dialog open={Boolean(removeVaultConfirm)} onOpenChange={(open) => !open && setRemoveVaultConfirm(null)}>
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
@@ -1729,21 +2248,26 @@ function SecretsHowToUse() {
 function SecretsFiltersPopover({
   statusFilter,
   providerFilter,
+  providedByFilter,
   providers,
   activeFilterCount,
   onStatusChange,
   onProviderChange,
+  onProvidedByChange,
 }: {
   statusFilter: SecretStatus | "all";
   providerFilter: SecretProvider | "all";
+  providedByFilter: ProvidedByFilter;
   providers: SecretProviderDescriptor[];
   activeFilterCount: number;
   onStatusChange: (value: SecretStatus | "all") => void;
   onProviderChange: (value: SecretProvider | "all") => void;
+  onProvidedByChange: (value: ProvidedByFilter) => void;
 }) {
   const resetFilters = () => {
     onStatusChange("active");
     onProviderChange("all");
+    onProvidedByChange("all");
   };
 
   const statusOptions: Array<{ value: SecretStatus | "all"; label: string }> = [
@@ -1789,7 +2313,7 @@ function SecretsFiltersPopover({
             ) : null}
           </div>
 
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
             <div className="space-y-1">
               <span className="text-xs text-muted-foreground">Status</span>
               <div className="space-y-0.5">
@@ -1798,6 +2322,25 @@ function SecretsFiltersPopover({
                     <Checkbox
                       checked={statusFilter === option.value}
                       onCheckedChange={() => onStatusChange(option.value)}
+                    />
+                    <span className="text-sm">{option.label}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="space-y-1">
+              <span className="text-xs text-muted-foreground">Provided by</span>
+              <div className="space-y-0.5">
+                {[
+                  { value: "all" as const, label: "All sources" },
+                  { value: "company" as const, label: "Company" },
+                  { value: "user" as const, label: "Each user" },
+                ].map((option) => (
+                  <label key={option.value} className="flex cursor-pointer items-center gap-2 rounded-sm px-2 py-1 hover:bg-accent/50">
+                    <Checkbox
+                      checked={providedByFilter === option.value}
+                      onCheckedChange={() => onProvidedByChange(option.value)}
                     />
                     <span className="text-sm">{option.label}</span>
                   </label>
@@ -2492,6 +3035,139 @@ function TextField({
         {required ? null : <span className="text-muted-foreground/70"> (optional)</span>}
       </label>
       <Input id={id} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
+    </div>
+  );
+}
+
+function CoverageInline({
+  companyId,
+  definitionId,
+}: {
+  companyId: string;
+  definitionId: string;
+}) {
+  const coverageQuery = useQuery({
+    queryKey: queryKeys.secrets.userDefinitionCoverage(companyId, definitionId),
+    queryFn: () => secretsApi.userSecretDefinitionCoverage(companyId, definitionId),
+    staleTime: 30_000,
+  });
+  const summary = coverageQuery.data;
+  if (coverageQuery.isPending) return <span className="text-muted-foreground">Loading…</span>;
+  if (coverageQuery.isError) return <span className="text-destructive">Coverage unavailable</span>;
+  return (
+    <span className="inline-flex items-center gap-1 text-muted-foreground">
+      <Users className="h-3 w-3" />
+      {coverageSummaryLabel(summary)}
+      {summary && summary.missingCount > 0 ? (
+        <span className="text-amber-600 dark:text-amber-400">· {summary.missingCount} missing</span>
+      ) : null}
+    </span>
+  );
+}
+
+function UserSecretDetailsTab({ definition }: { definition: UserSecretDefinition }) {
+  return (
+    <dl className="grid grid-cols-2 gap-x-4 gap-y-3 text-xs">
+      <DetailRow label="Description">
+        <span>{definition.description ?? <span className="text-muted-foreground">—</span>}</span>
+      </DetailRow>
+      <DetailRow label="Provided by">Each user</DetailRow>
+      <DetailRow label="Key">
+        <code>{definition.key}</code>
+      </DetailRow>
+      <DetailRow label="Status">{definition.status}</DetailRow>
+      <DetailRow label="Created">{formatRelative(definition.createdAt)}</DetailRow>
+      <DetailRow label="Updated">{formatRelative(definition.updatedAt)}</DetailRow>
+      <div className="col-span-2">
+        <dt className="text-[11px] uppercase tracking-wide text-muted-foreground mb-1">
+          Usage guidance
+        </dt>
+        <dd className="text-foreground">
+          {definition.usageGuidance ?? <span className="text-muted-foreground">—</span>}
+        </dd>
+      </div>
+      <div className="col-span-2 rounded-md border border-violet-500/30 bg-violet-500/5 p-2 text-[11px] text-violet-800 dark:text-violet-200">
+        No value is stored on this admin row. Each member manages their own value under My secrets.
+      </div>
+    </dl>
+  );
+}
+
+function UserSecretCoverageTab({
+  companyId,
+  definitionId,
+}: {
+  companyId: string;
+  definitionId: string;
+}) {
+  const coverageQuery = useQuery({
+    queryKey: queryKeys.secrets.userDefinitionCoverage(companyId, definitionId),
+    queryFn: () => secretsApi.userSecretDefinitionCoverage(companyId, definitionId),
+    staleTime: 30_000,
+  });
+  if (coverageQuery.isPending) {
+    return <div className="py-6 text-center text-xs text-muted-foreground">Loading…</div>;
+  }
+  if (coverageQuery.isError) {
+    return <div className="py-6 text-center text-xs text-destructive">Coverage unavailable.</div>;
+  }
+  const summary: UserSecretCoverageSummary = coverageQuery.data;
+  const total = summary.configuredCount + summary.missingCount + summary.inactiveCount;
+  return (
+    <div className="space-y-3 text-sm">
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Users className="h-3.5 w-3.5" />
+        <span>{coverageSummaryLabel(summary)}</span>
+      </div>
+      <div className="grid grid-cols-3 gap-2 text-center text-xs">
+        <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 p-3">
+          <div className="text-lg font-semibold text-emerald-700 dark:text-emerald-300">
+            {summary.configuredCount}
+          </div>
+          <div className="text-muted-foreground">Set</div>
+        </div>
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3">
+          <div className="text-lg font-semibold text-amber-700 dark:text-amber-300">
+            {summary.missingCount}
+          </div>
+          <div className="text-muted-foreground">Missing</div>
+        </div>
+        <div className="rounded-md border border-border bg-muted/30 p-3">
+          <div className="text-lg font-semibold text-muted-foreground">
+            {summary.inactiveCount}
+          </div>
+          <div className="text-muted-foreground">Inactive</div>
+        </div>
+      </div>
+      <p className="text-xs text-muted-foreground">
+        Coverage is counts only across {total} member{total === 1 ? "" : "s"}. Secret values are never shown here.
+      </p>
+    </div>
+  );
+}
+
+function UserSecretUsageTab({ definition }: { definition: UserSecretDefinition }) {
+  return (
+    <div className="space-y-3 text-xs text-muted-foreground">
+      <div className="rounded-md border border-border bg-muted/20 p-3">
+        Bind runtime environment variables to this user-provided secret by choosing{" "}
+        <span className="font-medium text-foreground">User secret</span> and selecting{" "}
+        <code className="font-mono">{definition.key}</code>.
+      </div>
+      {definition.usageGuidance ? (
+        <div>
+          <p className="mb-1 text-[11px] uppercase tracking-wide text-muted-foreground">Member guidance</p>
+          <p className="text-foreground">{definition.usageGuidance}</p>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function UserSecretAccessEventsTab() {
+  return (
+    <div className="py-6 text-center text-xs text-muted-foreground">
+      Access events are recorded on each member&apos;s stored value when runtime resolution occurs.
     </div>
   );
 }

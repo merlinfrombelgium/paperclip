@@ -11,8 +11,8 @@ export const USER_SECRET_ACCENT_TEXT = "text-violet-700 dark:text-violet-300";
 export const USER_SECRET_ACCENT_BORDER = "border-violet-500/30";
 export const USER_SECRET_ACCENT_BG = "bg-violet-500/10";
 
-/** Small "User secret" pill used to mark user-scoped rows and headers. */
-export function UserSecretChip({ className }: { className?: string }) {
+/** Small pill used to mark user-scoped rows and headers. */
+export function UserSecretChip({ className, label = "User secret" }: { className?: string; label?: string }) {
   return (
     <span
       className={cn(
@@ -24,7 +24,7 @@ export function UserSecretChip({ className }: { className?: string }) {
       )}
     >
       <UserRound className="h-3 w-3" />
-      User secret
+      {label}
     </span>
   );
 }

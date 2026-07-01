@@ -5,10 +5,13 @@ import { flushSync } from "react-dom";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
+  CompanySecret,
   CompanySecretProviderConfig,
   RemoteSecretImportPreviewResult,
   SecretProviderConfigDiscoveryPreviewResult,
   SecretProviderDescriptor,
+  UserSecretCoverageSummary,
+  UserSecretDefinition,
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProviderVaultsTab, Secrets } from "./Secrets";
@@ -37,6 +40,16 @@ const mockSecretsApi = vi.hoisted(() => ({
   remove: vi.fn(),
   usage: vi.fn(),
   accessEvents: vi.fn(),
+  listUserSecretDefinitions: vi.fn(),
+  createUserSecretDefinition: vi.fn(),
+  updateUserSecretDefinition: vi.fn(),
+  removeUserSecretDefinition: vi.fn(),
+  userSecretDefinitionCoverage: vi.fn(),
+  listMyUserSecrets: vi.fn(),
+  createMyUserSecret: vi.fn(),
+  updateMyUserSecret: vi.fn(),
+  rotateMyUserSecret: vi.fn(),
+  removeMyUserSecret: vi.fn(),
 }));
 
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
@@ -210,10 +223,76 @@ function makeRemoteImportPreview(
   };
 }
 
+function makeCompanySecret(overrides: Partial<CompanySecret> = {}): CompanySecret {
+  return {
+    id: "secret-openai",
+    companyId: "company-1",
+    scope: "company",
+    ownerUserId: null,
+    userSecretDefinitionId: null,
+    key: "openai_api_key",
+    name: "OPENAI_API_KEY",
+    provider: "local_encrypted",
+    status: "active",
+    managedMode: "paperclip_managed",
+    externalRef: null,
+    providerConfigId: null,
+    providerMetadata: null,
+    latestVersion: 1,
+    description: null,
+    lastResolvedAt: null,
+    lastRotatedAt: null,
+    deletedAt: null,
+    createdByAgentId: null,
+    createdByUserId: "user-1",
+    referenceCount: 2,
+    createdAt: new Date("2026-05-06T00:00:00.000Z"),
+    updatedAt: new Date("2026-05-06T00:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+function makeUserSecretDefinition(overrides: Partial<UserSecretDefinition> = {}): UserSecretDefinition {
+  return {
+    id: "def-github",
+    companyId: "company-1",
+    key: "PERSONAL_GH_TOKEN",
+    name: "Personal GitHub token",
+    description: "Used when the responsible user's own repos must be reached.",
+    status: "active",
+    provider: "local_encrypted",
+    managedMode: "paperclip_managed",
+    providerConfigId: null,
+    providerMetadata: null,
+    usageGuidance: "Create a fine-grained PAT with repo read access.",
+    createdByAgentId: null,
+    createdByUserId: "user-1",
+    updatedByAgentId: null,
+    updatedByUserId: "user-1",
+    deletedAt: null,
+    createdAt: new Date("2026-06-01T00:00:00.000Z"),
+    updatedAt: new Date("2026-06-02T00:00:00.000Z"),
+    ...overrides,
+  };
+}
+
+const userSecretCoverage: UserSecretCoverageSummary = {
+  definitionId: "def-github",
+  configuredCount: 3,
+  missingCount: 2,
+  inactiveCount: 0,
+};
+
 function setInputValue(input: HTMLInputElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;
   setter?.call(input, value);
   input.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
+  const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(textarea, value);
+  textarea.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
 async function openAwsVaultDialog() {
@@ -258,6 +337,9 @@ describe("Secrets page layout", () => {
     mockSecretsApi.providerConfigs.mockResolvedValue(providerConfigs);
     mockSecretsApi.providerConfigDiscoveryPreview.mockResolvedValue(makeDiscoveryPreview());
     mockSecretsApi.remoteImportPreview.mockResolvedValue(makeRemoteImportPreview());
+    mockSecretsApi.listUserSecretDefinitions.mockResolvedValue([]);
+    mockSecretsApi.userSecretDefinitionCoverage.mockResolvedValue(userSecretCoverage);
+    mockSecretsApi.listMyUserSecrets.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -436,30 +518,7 @@ describe("Secrets page layout", () => {
   });
 
   it("opens reference details from the secrets table count", async () => {
-    mockSecretsApi.list.mockResolvedValue([
-      {
-        id: "secret-openai",
-        companyId: "company-1",
-        key: "openai_api_key",
-        name: "OPENAI_API_KEY",
-        provider: "local_encrypted",
-        status: "active",
-        managedMode: "paperclip_managed",
-        externalRef: null,
-        providerConfigId: null,
-        providerMetadata: null,
-        latestVersion: 1,
-        description: null,
-        lastResolvedAt: null,
-        lastRotatedAt: null,
-        deletedAt: null,
-        createdByAgentId: null,
-        createdByUserId: "user-1",
-        referenceCount: 2,
-        createdAt: new Date("2026-05-06T00:00:00.000Z"),
-        updatedAt: new Date("2026-05-06T00:00:00.000Z"),
-      },
-    ]);
+    mockSecretsApi.list.mockResolvedValue([makeCompanySecret()]);
     mockSecretsApi.usage.mockResolvedValue({
       secretId: "secret-openai",
       bindings: [
@@ -517,6 +576,179 @@ describe("Secrets page layout", () => {
     expect(document.body.textContent).toContain("Secret references");
     expect(document.body.textContent).toContain("CodexCoder");
     expect(document.body.textContent).toContain("env.OPENAI_API_KEY");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("merges company secrets and each-user definitions into the Secrets list", async () => {
+    mockSecretsApi.list.mockResolvedValue([makeCompanySecret()]);
+    mockSecretsApi.listUserSecretDefinitions.mockResolvedValue([makeUserSecretDefinition()]);
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <Secrets />
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    expect(container.textContent).toContain("OPENAI_API_KEY");
+    expect(container.textContent).toContain("Personal GitHub token");
+    expect(container.textContent).toContain("Company");
+    expect(container.textContent).toContain("Each user");
+    expect(container.textContent).toContain("3 of 5 set");
+    expect(container.textContent).not.toContain("User secret definitions");
+    expect(mockSecretsApi.list).toHaveBeenCalledWith("company-1");
+    expect(mockSecretsApi.listUserSecretDefinitions).toHaveBeenCalledWith("company-1");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("creates an each-user secret from the unified New secret dialog", async () => {
+    const definition = makeUserSecretDefinition({ name: "Personal GitHub token" });
+    mockSecretsApi.createUserSecretDefinition.mockResolvedValueOnce(definition);
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <Secrets />
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const newSecretButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("New secret"),
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      newSecretButton?.click();
+    });
+    await flushReact();
+
+    const eachUserButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Each user",
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      eachUserButton?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      eachUserButton?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+      eachUserButton?.click();
+    });
+    await flushReact();
+
+    const nameInput = document.getElementById("new-secret-name") as HTMLInputElement;
+    const keyInput = document.getElementById("new-secret-key") as HTMLInputElement;
+    const usageGuidance = document.getElementById("new-secret-usage-guidance") as HTMLTextAreaElement;
+    expect(document.getElementById("new-secret-provider")).toBeNull();
+    expect(document.getElementById("new-secret-vault")).toBeNull();
+    expect(document.getElementById("new-secret-value")).toBeNull();
+
+    await act(async () => {
+      setInputValue(nameInput, "Personal GitHub token");
+      setTextareaValue(usageGuidance, "Create a fine-grained PAT with repo read access.");
+    });
+    await flushReact();
+
+    expect(keyInput.value).toBe("PERSONAL_GITHUB_TOKEN");
+
+    const createButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Create user-provided secret"),
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      createButton?.click();
+    });
+    await flushReact();
+
+    expect(mockSecretsApi.createUserSecretDefinition).toHaveBeenCalledWith("company-1", {
+      name: "Personal GitHub token",
+      description: null,
+      usageGuidance: "Create a fine-grained PAT with repo read access.",
+      key: "PERSONAL_GITHUB_TOKEN",
+      status: "active",
+    });
+    expect(mockSecretsApi.create).not.toHaveBeenCalled();
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("opens the each-user detail sheet with coverage and set-my-value actions", async () => {
+    const definition = makeUserSecretDefinition();
+    mockSecretsApi.listUserSecretDefinitions.mockResolvedValue([definition]);
+    mockSecretsApi.listMyUserSecrets.mockResolvedValue([{ definition, secret: null }]);
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <Secrets />
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const rowOpenButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Open",
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      rowOpenButton?.click();
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("Personal GitHub token");
+    expect(document.body.textContent).toContain("Details");
+    expect(document.body.textContent).toContain("Coverage");
+    expect(document.body.textContent).toContain("Usage");
+    expect(document.body.textContent).toContain("Access events");
+
+    const coverageButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Coverage",
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      coverageButton?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      coverageButton?.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Enter" }));
+      coverageButton?.click();
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("3 of 5 set");
+    expect(document.body.textContent).toContain("Secret values are never shown here");
+
+    const setValueButton = Array.from(document.body.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("Set my value"),
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      setValueButton?.click();
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("Set your value");
+    expect(document.body.textContent).toContain("PERSONAL_GH_TOKEN");
 
     await act(async () => {
       root.unmount();
