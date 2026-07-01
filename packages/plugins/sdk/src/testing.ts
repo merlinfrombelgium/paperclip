@@ -1206,6 +1206,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
             parentIssueId: null,
             title: declaration.title,
             description: declaration.description ?? null,
+            responsibleUserId: null,
             assigneeAgentId,
             priority: declaration.priority ?? "medium",
             status: declaration.status ?? (assigneeAgentId ? "active" : "paused"),
