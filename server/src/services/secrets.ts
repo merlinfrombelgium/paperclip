@@ -2122,9 +2122,9 @@ export function secretService(db: Db) {
       const secret = await getUserSecretValueById(companyId, ownerUserId, secretId);
       if (
         patch.value != null ||
-        patch.externalRef !== undefined ||
-        patch.providerVersionRef !== undefined ||
-        patch.providerConfigId !== undefined
+        patch.externalRef != null ||
+        patch.providerVersionRef != null ||
+        patch.providerConfigId != null
       ) {
         return await secretService(db).rotateCurrentUserSecretValue(
           companyId,

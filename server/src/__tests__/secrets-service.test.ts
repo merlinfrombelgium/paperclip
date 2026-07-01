@@ -598,7 +598,7 @@ describeEmbeddedPostgres("secretService", () => {
     expect(JSON.stringify(events)).not.toContain("user-one-secret");
   });
 
-  it("treats null user-secret value patches as non-rotation updates", async () => {
+  it("treats nullable user-secret value patches as non-rotation updates", async () => {
     const companyId = await seedCompany();
     await seedCompanyMember(companyId, "user-1", "owner");
     const svc = secretService(db);
@@ -614,6 +614,9 @@ describeEmbeddedPostgres("secretService", () => {
 
     const updated = await svc.updateCurrentUserSecretValue(companyId, "user-1", secret.id, {
       value: null,
+      externalRef: null,
+      providerVersionRef: null,
+      providerConfigId: null,
     });
 
     expect(updated.latestVersion).toBe(secret.latestVersion);
