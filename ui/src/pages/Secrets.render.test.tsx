@@ -703,6 +703,42 @@ describe("Secrets page layout", () => {
     });
   });
 
+  it("opens the New secret dialog when provider queries fail", async () => {
+    mockSecretsApi.providers.mockRejectedValueOnce(new ApiError(403, "Providers unavailable"));
+    mockSecretsApi.providerConfigs.mockRejectedValueOnce(new ApiError(403, "Provider vaults unavailable"));
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter>
+          <QueryClientProvider client={queryClient}>
+            <Secrets />
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const newSecretButton = Array.from(container.querySelectorAll("button")).find(
+      (button) => button.textContent?.includes("New secret"),
+    ) as HTMLButtonElement | undefined;
+    await act(async () => {
+      newSecretButton?.click();
+    });
+    await flushReact();
+
+    expect(document.body.textContent).toContain("Create secret");
+    expect(document.body.textContent).toContain("Select a provider.");
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
   it("opens the each-user detail sheet with coverage and set-my-value actions", async () => {
     const definition = makeUserSecretDefinition();
     mockSecretsApi.listUserSecretDefinitions.mockResolvedValue([definition]);

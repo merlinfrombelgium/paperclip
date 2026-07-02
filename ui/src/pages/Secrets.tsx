@@ -143,6 +143,12 @@ type SafeProviderErrorDetails = {
   safeAlternative?: string;
 };
 
+const EMPTY_SECRETS: CompanySecret[] = [];
+const EMPTY_USER_SECRET_DEFINITIONS: UserSecretDefinition[] = [];
+const EMPTY_MY_USER_SECRETS: MyUserSecretEntry[] = [];
+const EMPTY_SECRET_PROVIDERS: SecretProviderDescriptor[] = [];
+const EMPTY_PROVIDER_CONFIGS: CompanySecretProviderConfig[] = [];
+
 const PROVIDER_ORDER: SecretProvider[] = [
   "local_encrypted",
   "aws_secrets_manager",
@@ -693,11 +699,11 @@ export function Secrets() {
     retry: false,
   });
 
-  const secrets = secretsQuery.data ?? [];
-  const userDefinitions = userDefinitionsQuery.data ?? [];
-  const myUserSecrets = myUserSecretsQuery.data ?? [];
-  const providers = providersQuery.data ?? [];
-  const providerConfigs = providerConfigsQuery.data ?? [];
+  const secrets = secretsQuery.data ?? EMPTY_SECRETS;
+  const userDefinitions = userDefinitionsQuery.data ?? EMPTY_USER_SECRET_DEFINITIONS;
+  const myUserSecrets = myUserSecretsQuery.data ?? EMPTY_MY_USER_SECRETS;
+  const providers = providersQuery.data ?? EMPTY_SECRET_PROVIDERS;
+  const providerConfigs = providerConfigsQuery.data ?? EMPTY_PROVIDER_CONFIGS;
   const selectedSecret = useMemo(
     () => secrets.find((secret) => secret.id === selectedSecretId) ?? null,
     [secrets, selectedSecretId],
@@ -1199,9 +1205,11 @@ export function Secrets() {
     if (!createOpen) return;
     const current = providerConfigs.find((config) => config.id === createForm.providerConfigId);
     if (current?.provider === createForm.provider) return;
+    const nextProviderConfigId = getDefaultProviderConfigId(providerConfigs, createForm.provider);
+    if (nextProviderConfigId === createForm.providerConfigId) return;
     setCreateForm((form) => ({
       ...form,
-      providerConfigId: getDefaultProviderConfigId(providerConfigs, form.provider),
+      providerConfigId: nextProviderConfigId,
     }));
   }, [createForm.provider, createForm.providerConfigId, createOpen, providerConfigs]);
 
