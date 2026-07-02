@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { Link } from "@/lib/router";
-import type { Issue, IssueLabel, Project } from "@paperclipai/shared";
+import { deriveResponsibleUser, type Issue, type IssueLabel, type Project } from "@paperclipai/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdapterModel } from "../api/agents";
 import { accessApi } from "../api/access";
@@ -13,7 +13,7 @@ import { issuesApi } from "../api/issues";
 import { projectsApi } from "../api/projects";
 import { useCompany } from "../context/CompanyContext";
 import { queryKeys } from "../lib/queryKeys";
-import { buildCompanyUserInlineOptions, buildCompanyUserLabelMap, isAgentTaskTarget } from "../lib/company-members";
+import { buildCompanyUserInlineOptions, buildCompanyUserLabelMap, buildCompanyUserProfileMap, isAgentTaskTarget } from "../lib/company-members";
 import { ISSUE_OVERRIDE_ADAPTER_TYPES, type IssueModelLane } from "../lib/issue-assignee-overrides";
 import { useProjectOrder } from "../hooks/useProjectOrder";
 import {
@@ -838,6 +838,10 @@ export function IssueProperties({
     () => buildCompanyUserLabelMap(companyMembers?.users),
     [companyMembers?.users],
   );
+  const userProfileMap = useMemo(
+    () => buildCompanyUserProfileMap(companyMembers?.users),
+    [companyMembers?.users],
+  );
   const otherUserOptions = useMemo(
     () => buildCompanyUserInlineOptions(companyMembers?.users, { excludeUserIds: [currentUserId, issue.createdByUserId] }),
     [companyMembers?.users, currentUserId, issue.createdByUserId],
@@ -1064,6 +1068,15 @@ export function IssueProperties({
   const userLabel = (userId: string | null | undefined) => formatAssigneeUserLabel(userId, currentUserId, userLabelMap);
   const assigneeUserLabel = userLabel(issue.assigneeUserId);
   const creatorUserLabel = userLabel(issue.createdByUserId);
+  const responsibleUser = deriveResponsibleUser(issue);
+  const responsibleUserLabel = userLabel(responsibleUser.userId);
+  const creatorUserProfile = issue.createdByUserId ? userProfileMap.get(issue.createdByUserId) : null;
+  const responsibleUserProfile = responsibleUser.userId ? userProfileMap.get(responsibleUser.userId) : null;
+  const createdByResponsibleUser = Boolean(
+    issue.createdByUserId
+    && responsibleUser.userId
+    && issue.createdByUserId === responsibleUser.userId,
+  );
   const selectedAssigneeValue = issue.assigneeAgentId
     ? `agent:${issue.assigneeAgentId}`
     : issue.assigneeUserId
@@ -1762,7 +1775,7 @@ export function IssueProperties({
   );
 
   const assigneeTrigger = assignee ? (
-    <Identity name={assignee.name} size="sm" />
+    <Identity name={assignee.name} size="sm" shape="square" />
   ) : assigneeUserLabel ? (
     <>
       <User className="h-3.5 w-3.5 text-muted-foreground" />
@@ -1845,11 +1858,12 @@ export function IssueProperties({
       }}
     >
       {option.kind === "agent" ? (
-        <AgentIcon icon={option.agent.icon} className="shrink-0 h-3 w-3 text-muted-foreground" />
+        <Identity name={option.agent.name} size="xs" shape="square" className="min-w-0 flex-1" />
       ) : option.kind === "user" ? (
-        <User className="h-3 w-3 shrink-0 text-muted-foreground" />
-      ) : null}
-      <span className="min-w-0 flex-1 truncate">{option.label}</span>
+        <Identity name={option.label} size="xs" className="min-w-0 flex-1" />
+      ) : (
+        <span className="min-w-0 flex-1 truncate">{option.label}</span>
+      )}
       {option.value === selectedAssigneeValue ? (
         <Check className="ml-auto h-3.5 w-3.5 shrink-0 text-foreground" aria-hidden="true" />
       ) : null}
@@ -2361,6 +2375,49 @@ export function IssueProperties({
           {assigneeContent}
         </PropertyPicker>
 
+        <div className="space-y-1">
+          {(issue.createdByAgentId || issue.createdByUserId) ? (
+            <PropertyRow label={createdByResponsibleUser ? "Kicked off by · responsible" : "Kicked off by"}>
+              {issue.createdByAgentId ? (
+                <Link
+                  to={`/agents/${issue.createdByAgentId}`}
+                  className="hover:underline"
+                >
+                  <Identity
+                    name={agentName(issue.createdByAgentId) ?? issue.createdByAgentId.slice(0, 8)}
+                    size="sm"
+                    shape="square"
+                  />
+                </Link>
+              ) : (
+                <Identity
+                  name={creatorUserLabel ?? creatorUserProfile?.label ?? "User"}
+                  avatarUrl={creatorUserProfile?.image ?? null}
+                  size="sm"
+                />
+              )}
+            </PropertyRow>
+          ) : null}
+          {!createdByResponsibleUser ? (
+            <PropertyRow label="Responsible">
+              {responsibleUser.userId ? (
+                <>
+                  <Identity
+                    name={responsibleUserLabel ?? responsibleUserProfile?.label ?? "User"}
+                    avatarUrl={responsibleUserProfile?.image ?? null}
+                    size="sm"
+                  />
+                  {responsibleUser.isAutoDerived ? (
+                    <span className="text-xs text-muted-foreground">(auto)</span>
+                  ) : null}
+                </>
+              ) : (
+                <span className="text-sm text-muted-foreground">Unassigned</span>
+              )}
+            </PropertyRow>
+          ) : null}
+        </div>
+
         {showAssigneeAdapterOptions ? (
           <PropertyPicker
             inline={inline}
@@ -2719,23 +2776,6 @@ export function IssueProperties({
       <Separator />
 
       <div className="space-y-1">
-        {(issue.createdByAgentId || issue.createdByUserId) && (
-          <PropertyRow label="Created by">
-            {issue.createdByAgentId ? (
-              <Link
-                to={`/agents/${issue.createdByAgentId}`}
-                className="hover:underline"
-              >
-                <Identity name={agentName(issue.createdByAgentId) ?? issue.createdByAgentId.slice(0, 8)} size="sm" />
-              </Link>
-            ) : (
-              <>
-                <User className="h-3.5 w-3.5 text-muted-foreground" />
-                <span className="text-sm">{creatorUserLabel ?? "User"}</span>
-              </>
-            )}
-          </PropertyRow>
-        )}
         {issue.startedAt && (
           <PropertyRow label="Started">
             <span className="text-sm">{formatDateTime(issue.startedAt)}</span>
