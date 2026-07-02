@@ -12,6 +12,7 @@ import {
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
+import { assertCompanyAccess } from "../routes/authz.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -100,6 +101,10 @@ function createApp(db: any) {
   );
   app.get("/actor", (req, res) => {
     res.json(req.actor);
+  });
+  app.get("/companies/:companyId/protected", (req, res) => {
+    assertCompanyAccess(req, req.params.companyId);
+    res.json({ ok: true });
   });
   app.use(errorHandler);
   return app;
@@ -260,6 +265,40 @@ describe("agent auth middleware", () => {
       companyId,
       onBehalfOfUserId: "user-key",
       source: "agent_key",
+    });
+  });
+
+  it("rejects agent keys that lack a responsible user binding and audits the denial", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const keyId = randomUUID();
+    const token = "pcp_test_agent_key_without_user";
+    const { db, activity } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: keyId,
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: null,
+      },
+    });
+
+    const res = await request(createApp(db))
+      .get(`/companies/${companyId}/protected`)
+      .set("Authorization", `Bearer ${token}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("RESPONSIBLE_USER_UNAVAILABLE");
+    expect(activity).toHaveLength(1);
+    expect(activity[0]).toMatchObject({
+      companyId,
+      actorType: "agent",
+      actorId: agentId,
+      action: "auth.agent_key_missing_responsible_user",
+      entityType: "agent_api_key",
+      entityId: keyId,
+      details: { method: "GET", url: `/companies/${companyId}/protected` },
     });
   });
 });

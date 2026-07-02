@@ -18,7 +18,7 @@ import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { boardAuthService } from "../services/board-auth.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
-import { unprocessable } from "../errors.js";
+import { forbidden, unprocessable } from "../errors.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -102,6 +102,32 @@ async function auditAgentJwtRunHeaderMismatch(
     logger.warn(
       { err, companyId: input.companyId, agentId: input.agentId, claimRunId: input.claimRunId },
       "Failed to audit rejected agent JWT run header mismatch",
+    );
+  }
+}
+
+async function auditAgentKeyMissingResponsibleUser(
+  db: Db,
+  input: { companyId: string; agentId: string; keyId: string; method: string; url: string },
+) {
+  try {
+    await db.insert(activityLog).values({
+      companyId: input.companyId,
+      actorType: "agent",
+      actorId: input.agentId,
+      action: "auth.agent_key_missing_responsible_user",
+      entityType: "agent_api_key",
+      entityId: input.keyId,
+      ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
+      details: {
+        method: input.method,
+        url: input.url,
+      },
+    });
+  } catch (err) {
+    logger.warn(
+      { err, companyId: input.companyId, agentId: input.agentId, keyId: input.keyId },
+      "Failed to audit rejected agent key without responsible user binding",
     );
   }
 }
@@ -313,16 +339,31 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    const responsibleUserId = normalizeOptionalString(key.responsibleUserId);
+    if (!responsibleUserId) {
+      await auditAgentKeyMissingResponsibleUser(db, {
+        companyId: key.companyId,
+        agentId: key.agentId,
+        keyId: key.id,
+        method: req.method,
+        url: req.originalUrl,
+      });
+      next(forbidden("Responsible user is unavailable for this agent key", {
+        code: "RESPONSIBLE_USER_UNAVAILABLE",
+      }));
+      return;
+    }
+
     req.actor = {
       type: "agent",
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
       keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
-      onBehalfOfUserId: normalizeOptionalString(key.responsibleUserId),
+      onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,
-        userId: normalizeOptionalString(key.responsibleUserId),
+        userId: responsibleUserId,
       }),
       runId: runIdHeader || undefined,
       source: "agent_key",
