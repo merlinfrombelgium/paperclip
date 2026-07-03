@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { Link } from "@/lib/router";
-import { type Issue, type IssueLabel, type Project } from "@paperclipai/shared";
+import { deriveOriginatingActor, type Issue, type IssueLabel, type Project } from "@paperclipai/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { AdapterModel } from "../api/agents";
 import { accessApi } from "../api/access";
@@ -1069,7 +1069,13 @@ export function IssueProperties({
   const actualUserLabel = (userId: string | null | undefined) => formatUserLabel(userId, userLabelMap);
   const assigneeUserLabel = userLabel(issue.assigneeUserId);
   const creatorUserLabel = actualUserLabel(issue.createdByUserId);
-  const creatorUserProfile = issue.createdByUserId ? userProfileMap.get(issue.createdByUserId) : null;
+  const originatingActor = deriveOriginatingActor(issue);
+  const originatingUserProfile =
+    originatingActor?.kind === "user" ? userProfileMap.get(originatingActor.id) : null;
+  const originatingViaAgentName =
+    originatingActor?.kind === "user" && originatingActor.viaAgentId
+      ? agentName(originatingActor.viaAgentId) ?? originatingActor.viaAgentId.slice(0, 8)
+      : null;
   const selectedAssigneeValue = issue.assigneeAgentId
     ? `agent:${issue.assigneeAgentId}`
     : issue.assigneeUserId
@@ -2369,25 +2375,32 @@ export function IssueProperties({
         </PropertyPicker>
 
         <div className="space-y-1">
-          {(issue.createdByAgentId || issue.createdByUserId) ? (
+          {originatingActor ? (
             <PropertyRow label="Originating">
-              {issue.createdByAgentId ? (
+              {originatingActor.kind === "agent" ? (
                 <Link
-                  to={`/agents/${issue.createdByAgentId}`}
+                  to={`/agents/${originatingActor.id}`}
                   className="hover:underline"
                 >
                   <Identity
-                    name={agentName(issue.createdByAgentId) ?? issue.createdByAgentId.slice(0, 8)}
+                    name={agentName(originatingActor.id) ?? originatingActor.id.slice(0, 8)}
                     size="sm"
                     shape="square"
                   />
                 </Link>
               ) : (
-                <Identity
-                  name={creatorUserLabel ?? creatorUserProfile?.label ?? "User"}
-                  avatarUrl={creatorUserProfile?.image ?? null}
-                  size="sm"
-                />
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <Identity
+                    name={actualUserLabel(originatingActor.id) ?? originatingUserProfile?.label ?? "User"}
+                    avatarUrl={originatingUserProfile?.image ?? null}
+                    size="sm"
+                  />
+                  {originatingViaAgentName ? (
+                    <span className="shrink-0 truncate text-xs text-muted-foreground">
+                      via {originatingViaAgentName}
+                    </span>
+                  ) : null}
+                </span>
               )}
             </PropertyRow>
           ) : null}
