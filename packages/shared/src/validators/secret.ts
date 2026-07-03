@@ -193,8 +193,8 @@ export type CreateUserSecretValue = z.infer<typeof createUserSecretValueSchema>;
 export const updateUserSecretValueSchema = z.object({
   status: z.enum(SECRET_STATUSES).optional(),
   value: z.string().min(1).optional().nullable(),
-  externalRef: z.string().optional().nullable(),
-  providerVersionRef: z.string().optional().nullable(),
+  externalRef: z.string().min(1).optional().nullable(),
+  providerVersionRef: z.string().min(1).optional().nullable(),
   providerConfigId: z.string().uuid().optional().nullable(),
 });
 
@@ -202,8 +202,8 @@ export type UpdateUserSecretValue = z.infer<typeof updateUserSecretValueSchema>;
 
 export const rotateUserSecretValueSchema = z.object({
   value: z.string().min(1).optional().nullable(),
-  externalRef: z.string().optional().nullable(),
-  providerVersionRef: z.string().optional().nullable(),
+  externalRef: z.string().min(1).optional().nullable(),
+  providerVersionRef: z.string().min(1).optional().nullable(),
   providerConfigId: z.string().uuid().optional().nullable(),
 }).superRefine(requireSecretRotationInput);
 

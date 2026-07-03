@@ -191,6 +191,33 @@ describeEmbeddedPostgres("heartbeat responsible-user invariant", () => {
     expect(completed?.responsibleUserId).toBe(ownerUserId);
   });
 
+  it("does not use an issue creator as an implicit responsible user for automated issue runs", async () => {
+    const { companyId, agentId, ownerUserId } = await seedCompany();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Creator is not credential owner",
+      status: "todo",
+      assigneeAgentId: agentId,
+      createdByUserId: `creator-${randomUUID()}`,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId, commentId: randomUUID() },
+      requestedByActorType: "user",
+      requestedByActorId: `commenter-${randomUUID()}`,
+      contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_commented" },
+    });
+
+    expect(run).not.toBeNull();
+    const completed = await waitForRun(db, run!.id);
+    expect(completed?.responsibleUserId).toBe(ownerUserId);
+  });
+
   it("fails dispatch before creating a run when no responsible user can be resolved", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
