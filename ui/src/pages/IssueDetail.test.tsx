@@ -1005,12 +1005,14 @@ describe("IssueDetail", () => {
     ).toBe(false);
   });
 
-  it("shows assignee and actual originating user in the issue header", async () => {
+  it("shows assignee and originating avatars in the issue header metadata", async () => {
     mockIssuesApi.get.mockResolvedValue(createIssue({
       assigneeAgentId: "agent-1",
+      projectId: "project-1",
       createdByUserId: "user-1",
     }));
     mockAgentsApi.list.mockResolvedValue([createAgent({ name: "CodexCoder" })]);
+    mockProjectsApi.list.mockResolvedValue([{ id: "project-1", name: "Core Product", color: "#2563eb" }]);
     mockAccessApi.listUserDirectory.mockResolvedValue({
       users: [
         {
@@ -1036,12 +1038,18 @@ describe("IssueDetail", () => {
     await flushReact();
 
     await waitForAssertion(() => {
-      expect(container.textContent).toContain("Assignee:");
-      expect(container.textContent).toContain("CodexCoder");
-      expect(container.textContent).toContain("Originating:");
-      expect(container.textContent).toContain("Dotta");
-      expect(container.textContent).not.toContain("You");
-      expect(container.querySelector('[title="Originating is the person or agent that created this task."]')).toBeTruthy();
+      const avatarStack = container.querySelector('[data-testid="issue-attribution-avatar-stack"]');
+      const assigneeAvatar = container.querySelector('[data-testid="issue-assignee-avatar"]');
+      const originatingAvatar = container.querySelector('[data-testid="issue-originating-avatar"]');
+
+      expect(container.textContent).toContain("Core Product");
+      expect(avatarStack).toBeTruthy();
+      expect(assigneeAvatar?.getAttribute("title")).toBe("Assignee: CodexCoder");
+      expect(originatingAvatar?.getAttribute("title")).toBe("Originating: Dotta");
+      expect(avatarStack?.textContent).not.toContain("Assignee");
+      expect(avatarStack?.textContent).not.toContain("Originating");
+      expect(avatarStack?.textContent).not.toContain("CodexCoder");
+      expect(avatarStack?.textContent).not.toContain("Dotta");
     });
   });
 

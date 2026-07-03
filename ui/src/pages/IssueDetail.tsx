@@ -112,6 +112,7 @@ import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Avatar, AvatarFallback, AvatarGroup, AvatarImage } from "@/components/ui/avatar";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
@@ -466,35 +467,27 @@ export type AttributionActor = {
   avatarUrl?: string | null;
 };
 
-function AttributionIdentity({ actor }: { actor: AttributionActor }) {
-  return (
-    <Identity
-      name={actor.name}
-      avatarUrl={actor.avatarUrl}
-      size="xs"
-      shape={actor.kind === "agent" ? "square" : "circle"}
-      className="min-w-0 [&>span:last-child]:text-xs"
-    />
-  );
+function attributionInitials(name: string): string {
+  const parts = name.trim().split(/\s+/);
+  if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  return name.slice(0, 2).toUpperCase();
 }
 
-function LabeledAttributionIdentity({
-  label,
-  actor,
-  title,
-}: {
-  label: string;
-  actor: AttributionActor;
-  title?: string;
-}) {
+function AttributionAvatar({ label, actor }: { label: "Assignee" | "Originating"; actor: AttributionActor }) {
+  const tooltip = `${label}: ${actor.name}`;
+
   return (
-    <span
-      className="inline-flex min-w-0 items-center gap-1.5"
-      title={title}
+    <Avatar
+      size="xs"
+      shape={actor.kind === "agent" ? "square" : "circle"}
+      title={tooltip}
+      aria-label={tooltip}
+      data-testid={`issue-${label.toLowerCase()}-avatar`}
+      className="ring-2 ring-background"
     >
-      <span className="shrink-0 font-medium text-muted-foreground">{label}:</span>
-      <AttributionIdentity actor={actor} />
-    </span>
+      {actor.avatarUrl ? <AvatarImage src={actor.avatarUrl} alt="" /> : null}
+      <AvatarFallback>{attributionInitials(actor.name)}</AvatarFallback>
+    </Avatar>
   );
 }
 
@@ -544,16 +537,10 @@ function IssueAttributionByline({
   if (!assignee && !originator) return null;
 
   return (
-    <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-      {assignee ? <LabeledAttributionIdentity label="Assignee" actor={assignee} /> : null}
-      {originator ? (
-        <LabeledAttributionIdentity
-          label="Originating"
-          actor={originator}
-          title="Originating is the person or agent that created this task."
-        />
-      ) : null}
-    </div>
+    <AvatarGroup className="-space-x-1.5" aria-label="Task people" data-testid="issue-attribution-avatar-stack">
+      {assignee ? <AttributionAvatar label="Assignee" actor={assignee} /> : null}
+      {originator ? <AttributionAvatar label="Originating" actor={originator} /> : null}
+    </AvatarGroup>
   );
 }
 
@@ -3915,6 +3902,13 @@ export function IssueDetail() {
             </span>
           )}
 
+          <IssueAttributionByline
+            issue={issue}
+            agentMap={agentMap}
+            userProfileMap={userProfileMap}
+            userLabelMap={userLabelMap}
+          />
+
           {(issue.labels ?? []).length > 0 && (
             <div className="hidden sm:flex items-center gap-1">
               {(issue.labels ?? []).slice(0, 4).map((label) => (
@@ -4131,13 +4125,6 @@ export function IssueDetail() {
           onSave={(title) => updateIssue.mutateAsync({ title })}
           as="h2"
           className="text-xl font-bold"
-        />
-
-        <IssueAttributionByline
-          issue={issue}
-          agentMap={agentMap}
-          userProfileMap={userProfileMap}
-          userLabelMap={userLabelMap}
         />
 
         <InlineEditor
