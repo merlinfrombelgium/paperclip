@@ -2377,7 +2377,7 @@ export function IssueProperties({
 
         <div className="space-y-1">
           {(issue.createdByAgentId || issue.createdByUserId) ? (
-            <PropertyRow label={createdByResponsibleUser ? "Kicked off by · responsible" : "Kicked off by"}>
+            <PropertyRow label="Originating">
               {issue.createdByAgentId ? (
                 <Link
                   to={`/agents/${issue.createdByAgentId}`}
