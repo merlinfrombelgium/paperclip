@@ -1066,6 +1066,38 @@ export function routineService(
       }
     }
 
+    // Open-but-idle execution issues are still the coalesce target for the
+    // next fire, so surface them as the routine's active issue too.
+    const stillMissingRoutineIds = routineIds.filter((routineId) => !rowsByOriginId.has(routineId));
+    if (stillMissingRoutineIds.length > 0) {
+      const openRows = await db
+        .selectDistinctOn([issues.originId], {
+          originId: issues.originId,
+          id: issues.id,
+          identifier: issues.identifier,
+          title: issues.title,
+          status: issues.status,
+          priority: issues.priority,
+          updatedAt: issues.updatedAt,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.companyId, companyId),
+            eq(issues.originKind, "routine_execution"),
+            inArray(issues.originId, stillMissingRoutineIds),
+            inArray(issues.status, OPEN_ISSUE_STATUSES),
+            isNull(issues.hiddenAt),
+          ),
+        )
+        .orderBy(issues.originId, desc(issues.updatedAt), desc(issues.createdAt));
+
+      for (const row of openRows) {
+        if (!row.originId) continue;
+        rowsByOriginId.set(row.originId, row);
+      }
+    }
+
     const map = new Map<string, RoutineListItem["activeIssue"]>();
     for (const row of rowsByOriginId.values()) {
       if (!row.originId) continue;
@@ -1181,15 +1213,28 @@ export function routineService(
     );
   }
 
+  // Any open execution issue counts as live for concurrency purposes — the
+  // heartbeat-run joins only prioritize an actively-executing issue when
+  // several are open. `hasLiveRun: false` means the issue is open but idle,
+  // so a coalescing dispatch must re-wake its assignee instead of assuming a
+  // running heartbeat will pick the work up.
   async function findLiveExecutionIssue(
     routine: typeof routines.$inferSelect,
     executor: Db = db,
     dispatchFingerprint?: string | null,
     origin?: { kind: string; id: string | null },
-  ) {
+  ): Promise<{ issue: typeof issues.$inferSelect; hasLiveRun: boolean } | null> {
     const fingerprintCondition = routineExecutionFingerprintCondition(dispatchFingerprint);
     const originKind = origin?.kind ?? "routine_execution";
     const originId = origin?.id ?? routine.id;
+    const openIssueFilters = and(
+      eq(issues.companyId, routine.companyId),
+      eq(issues.originKind, originKind),
+      eq(issues.originId, originId),
+      inArray(issues.status, OPEN_ISSUE_STATUSES),
+      isNull(issues.hiddenAt),
+      ...(fingerprintCondition ? [fingerprintCondition] : []),
+    );
     const executionBoundIssue = await executor
       .select()
       .from(issues)
@@ -1200,22 +1245,13 @@ export function routineService(
           inArray(heartbeatRuns.status, LIVE_HEARTBEAT_RUN_STATUSES),
         ),
       )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          isNull(issues.hiddenAt),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(openIssueFilters)
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
-    if (executionBoundIssue) return executionBoundIssue;
+    if (executionBoundIssue) return { issue: executionBoundIssue, hasLiveRun: true };
 
-    return executor
+    const legacyBoundIssue = await executor
       .select()
       .from(issues)
       .innerJoin(
@@ -1226,19 +1262,20 @@ export function routineService(
           sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = cast(${issues.id} as text)`,
         ),
       )
-      .where(
-        and(
-          eq(issues.companyId, routine.companyId),
-          eq(issues.originKind, originKind),
-          eq(issues.originId, originId),
-          inArray(issues.status, OPEN_ISSUE_STATUSES),
-          isNull(issues.hiddenAt),
-          ...(fingerprintCondition ? [fingerprintCondition] : []),
-        ),
-      )
+      .where(openIssueFilters)
       .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
       .limit(1)
       .then((rows) => rows[0]?.issues ?? null);
+    if (legacyBoundIssue) return { issue: legacyBoundIssue, hasLiveRun: true };
+
+    const openIssue = await executor
+      .select()
+      .from(issues)
+      .where(openIssueFilters)
+      .orderBy(desc(issues.updatedAt), desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return openIssue ? { issue: openIssue, hasLiveRun: false } : null;
   }
 
   async function finalizeRun(runId: string, patch: Partial<typeof routineRuns.$inferInsert>, executor: Db = db) {
@@ -1507,11 +1544,12 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+        const activeExecution = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
         });
-        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+        if (activeExecution && input.routine.concurrencyPolicy !== "always_enqueue") {
+          const activeIssue = activeExecution.issue;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
@@ -1535,6 +1573,20 @@ export function routineService(
             issueId: activeIssue.id,
             nextRunAt,
           }, txDb);
+          // Coalescing into an open-but-idle issue must re-trigger its
+          // assignee, otherwise the fire is silently absorbed and the
+          // routine's work never happens until something else wakes the
+          // agent. Skip stays a true skip.
+          if (status === "coalesced" && !activeExecution.hasLiveRun) {
+            await queueIssueAssignmentWakeup({
+              heartbeat,
+              issue: activeIssue,
+              reason: "issue_assigned",
+              mutation: "coalesce",
+              contextSource: "routine.dispatch",
+              requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            });
+          }
           return updated ?? createdRun;
         }
 
@@ -1572,11 +1624,12 @@ export function routineService(
             throw error;
           }
 
-          const existingIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+          const existingExecution = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
             kind: issueOriginKind,
             id: issueOriginId,
           });
-          if (!existingIssue) throw error;
+          if (!existingExecution) throw error;
+          const existingIssue = existingExecution.issue;
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           if (manualRunnerUserId) {
             await touchIssueForUserInbox(txDb, {
@@ -1600,6 +1653,16 @@ export function routineService(
             issueId: existingIssue.id,
             nextRunAt,
           }, txDb);
+          if (status === "coalesced" && !existingExecution.hasLiveRun) {
+            await queueIssueAssignmentWakeup({
+              heartbeat,
+              issue: existingIssue,
+              reason: "issue_assigned",
+              mutation: "coalesce",
+              contextSource: "routine.dispatch",
+              requestedByActorType: input.source === "schedule" ? "system" : undefined,
+            });
+          }
           return updated ?? createdRun;
         }
 
@@ -1806,7 +1869,7 @@ export function routineService(
                 : null,
             })),
           ),
-        findLiveExecutionIssue(row),
+        findLiveExecutionIssue(row).then((found) => found?.issue ?? null),
         listManagedRoutineMetadata([row.id]),
       ]);
 

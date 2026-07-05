@@ -229,51 +229,86 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(allRoutines.map((entry) => entry.id)).toEqual(expect.arrayContaining([routine.id, otherRoutine.id]));
   });
 
-  it("creates a fresh execution issue when the previous routine issue is open but idle", async () => {
-    const { companyId, issueSvc, routine, svc } = await seedFixture();
-    const previousRunId = randomUUID();
-    const previousIssue = await issueSvc.create(companyId, {
-      projectId: routine.projectId,
-      title: routine.title,
-      description: routine.description,
-      status: "todo",
-      priority: routine.priority,
-      assigneeAgentId: routine.assigneeAgentId,
-      originKind: "routine_execution",
-      originId: routine.id,
-      originRunId: previousRunId,
-    });
+  it("coalesces into an open idle execution issue and re-wakes its assignee", async () => {
+    const { agentId, routine, svc, wakeups } = await seedFixture();
 
-    await db.insert(routineRuns).values({
-      id: previousRunId,
-      companyId,
-      routineId: routine.id,
-      triggerId: null,
-      source: "manual",
-      status: "issue_created",
-      triggeredAt: new Date("2026-03-20T12:00:00.000Z"),
-      linkedIssueId: previousIssue.id,
-      completedAt: new Date("2026-03-20T12:00:00.000Z"),
-    });
+    const firstRun = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(firstRun.status).toBe("issue_created");
+    const firstIssueId = firstRun.linkedIssueId!;
+
+    // The execution heartbeat finishes but the agent legitimately parks the
+    // issue open (e.g. in_review waiting on an approval).
+    const boundRunId = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, firstIssueId))
+      .then((rows) => rows[0]?.executionRunId ?? null);
+    expect(boundRunId).toBeTruthy();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed" })
+      .where(eq(heartbeatRuns.id, boundRunId!));
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, firstIssueId));
 
     const detailBefore = await svc.getDetail(routine.id);
-    expect(detailBefore?.activeIssue).toBeNull();
+    expect(detailBefore?.activeIssue?.id).toBe(firstIssueId);
 
-    const run = await svc.runRoutine(routine.id, { source: "manual" });
-    expect(run.status).toBe("issue_created");
-    expect(run.linkedIssueId).not.toBe(previousIssue.id);
+    const wakeupsBefore = wakeups.length;
+    const secondRun = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(secondRun.status).toBe("coalesced");
+    expect(secondRun.linkedIssueId).toBe(firstIssueId);
+    expect(secondRun.coalescedIntoRunId).toBe(firstRun.id);
 
     const routineIssues = await db
-      .select({
-        id: issues.id,
-        originRunId: issues.originRunId,
-      })
+      .select({ id: issues.id })
       .from(issues)
       .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(1);
 
-    expect(routineIssues).toHaveLength(2);
-    expect(routineIssues.map((issue) => issue.id)).toContain(previousIssue.id);
-    expect(routineIssues.map((issue) => issue.id)).toContain(run.linkedIssueId);
+    expect(wakeups).toHaveLength(wakeupsBefore + 1);
+    expect(wakeups.at(-1)).toMatchObject({
+      agentId,
+      opts: expect.objectContaining({
+        reason: "issue_assigned",
+        payload: expect.objectContaining({ issueId: firstIssueId, mutation: "coalesce" }),
+      }),
+    });
+  });
+
+  it("skips without duplicating or waking when the previous issue is open but idle under skip_if_active", async () => {
+    const { routine, svc, wakeups } = await seedFixture();
+    await db
+      .update(routines)
+      .set({ concurrencyPolicy: "skip_if_active" })
+      .where(eq(routines.id, routine.id));
+
+    const firstRun = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(firstRun.status).toBe("issue_created");
+    const firstIssueId = firstRun.linkedIssueId!;
+
+    const boundRunId = await db
+      .select({ executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, firstIssueId))
+      .then((rows) => rows[0]?.executionRunId ?? null);
+    expect(boundRunId).toBeTruthy();
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "completed" })
+      .where(eq(heartbeatRuns.id, boundRunId!));
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, firstIssueId));
+
+    const wakeupsBefore = wakeups.length;
+    const secondRun = await svc.runRoutine(routine.id, { source: "manual" });
+    expect(secondRun.status).toBe("skipped");
+    expect(secondRun.linkedIssueId).toBe(firstIssueId);
+    expect(wakeups).toHaveLength(wakeupsBefore);
+
+    const routineIssues = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(eq(issues.originId, routine.id));
+    expect(routineIssues).toHaveLength(1);
   });
 
   it("creates draft routines without a project or default assignee", async () => {
