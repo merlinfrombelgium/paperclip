@@ -46,6 +46,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import {
   parseClaudeStreamJson,
+  classifyClaudeProviderLimit,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -856,10 +857,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             errorMessage: fallbackErrorMessage,
           })
         : null;
+      const providerLimit = transientUpstream
+        ? classifyClaudeProviderLimit({
+            parsed: null,
+            stdout: proc.stdout,
+            stderr: proc.stderr,
+            errorMessage: fallbackErrorMessage,
+          })
+        : null;
       const errorCode = loginMeta.requiresLogin
         ? "claude_auth_required"
         : transientUpstream
-        ? "claude_transient_upstream"
+        ? providerLimit?.errorCode ?? "claude_transient_upstream"
+        : null;
+      const providerRetryMeta = providerLimit
+        ? {
+            provider: providerLimit.provider,
+            retryGuidance: providerLimit.retryGuidance,
+            ...(transientRetryNotBefore ? { resetAt: transientRetryNotBefore.toISOString() } : {}),
+          }
         : null;
       return {
         exitCode: proc.exitCode,
@@ -869,11 +885,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorCode,
         errorFamily: transientUpstream ? "transient_upstream" : null,
         retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
-        errorMeta,
+        errorMeta: {
+          ...(errorMeta ?? {}),
+          ...(providerRetryMeta ?? {}),
+        },
         resultJson: {
           stdout: proc.stdout,
           stderr: proc.stderr,
           ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+          ...(providerRetryMeta ?? {}),
           ...(transientRetryNotBefore
             ? { retryNotBefore: transientRetryNotBefore.toISOString() }
             : {}),
@@ -953,6 +973,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    const providerLimit = transientUpstream
+      ? classifyClaudeProviderLimit({
+          parsed,
+          stdout: proc.stdout,
+          stderr: proc.stderr,
+          errorMessage,
+        })
+      : null;
     const resolvedErrorCode = loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && clearSessionForMaxTurns
@@ -960,9 +988,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : failed && poisonedPreviousMessageId
       ? "claude_poisoned_previous_message_id"
       : transientUpstream
-      ? "claude_transient_upstream"
+      ? providerLimit?.errorCode ?? "claude_transient_upstream"
       : claudeRefusal
       ? "claude_refusal"
+      : null;
+    const providerRetryMeta = providerLimit
+      ? {
+          provider: providerLimit.provider,
+          retryGuidance: providerLimit.retryGuidance,
+          ...(transientRetryNotBefore ? { resetAt: transientRetryNotBefore.toISOString() } : {}),
+        }
       : null;
     const mergedResultJson: Record<string, unknown> = {
       ...parsed,
@@ -970,6 +1005,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ...(failed && poisonedPreviousMessageId ? { stopReason: "claude_poisoned_previous_message_id" } : {}),
       ...(claudeRefusal ? { stopReason: "refusal", errorFamily: "model_refusal" } : {}),
       ...(transientUpstream ? { errorFamily: "transient_upstream" } : {}),
+      ...(providerRetryMeta ?? {}),
       ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
       ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
     };
@@ -986,7 +1022,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? "model_refusal"
         : null,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
-      errorMeta,
+      errorMeta: {
+        ...(errorMeta ?? {}),
+        ...(providerRetryMeta ?? {}),
+      },
       usage,
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,
