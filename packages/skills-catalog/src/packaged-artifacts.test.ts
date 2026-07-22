@@ -50,6 +50,7 @@ describe("skills catalog package artifacts", () => {
     expect(paths).toContain("dist/generated/catalog.json");
     expect(paths).toContain("generated/catalog.json");
     expect(paths).toContain("catalog/bundled/software-development/github-pr-workflow/SKILL.md");
+    expect(paths).toContain("catalog/optional/memory/agentmem/scripts/agentmem.mjs");
     expect(paths).toContain("catalog/optional/browser/agent-browser/SKILL.md");
     expect(paths).toContain("package.json");
   }, 120_000);

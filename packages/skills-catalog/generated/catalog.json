@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/skills-catalog",
   "packageVersion": "0.3.1",
-  "generatedAt": "2026-07-15T22:20:53.895Z",
+  "generatedAt": "2026-07-22T00:36:24.229Z",
   "skills": [
     {
       "id": "paperclipai:bundled:docs:doc-maintenance",
@@ -486,6 +486,50 @@
         }
       ],
       "contentHash": "sha256:276d85e98a4732f278204e26438aa95fde158dd2d15c1e427c4c7c7d492e769d"
+    },
+    {
+      "id": "paperclipai:optional:memory:agentmem",
+      "key": "paperclipai/optional/memory/agentmem",
+      "kind": "optional",
+      "category": "memory",
+      "slug": "agentmem",
+      "name": "agentmem",
+      "description": "Use ZiMi lane-3 shared agent memory through exactly two brokered operations, recall and write, without exposing database credentials or connection strings.",
+      "path": "catalog/optional/memory/agentmem",
+      "entrypoint": "SKILL.md",
+      "trustLevel": "scripts_executables",
+      "compatibility": "compatible",
+      "defaultInstall": false,
+      "recommendedForRoles": [
+        "engineer",
+        "operations",
+        "researcher"
+      ],
+      "requires": [
+        "node",
+        "postgres"
+      ],
+      "tags": [
+        "memory",
+        "agentmem",
+        "recall",
+        "provenance"
+      ],
+      "files": [
+        {
+          "path": "SKILL.md",
+          "kind": "skill",
+          "sizeBytes": 2937,
+          "sha256": "d11b40b295fdbeef8d70cdb859b4d8569fc9eeabd13a9dbd05ae57f8262a6c30"
+        },
+        {
+          "path": "scripts/agentmem.mjs",
+          "kind": "script",
+          "sizeBytes": 9013,
+          "sha256": "d69220ff126723c36bf1f4606fb53b47a54b07906fa41dfa8cf3fabca49a6708"
+        }
+      ],
+      "contentHash": "sha256:a6e35fc593e7d6eb37ef19f28704ddfbeda3d535945ec78e1e650f769de6b6f2"
     },
     {
       "id": "paperclipai:optional:product:design-critique",

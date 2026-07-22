@@ -20,6 +20,7 @@ const EXPECTED_OPTIONAL_KEYS = [
   "paperclipai/optional/browser/agent-browser",
   "paperclipai/optional/content/release-announcement",
   "paperclipai/optional/finance/ramp",
+  "paperclipai/optional/memory/agentmem",
   "paperclipai/optional/product/design-critique",
   "paperclipai/optional/research/last30days",
 ];
@@ -128,6 +129,7 @@ describe("shipped skills catalog", () => {
     // carry the "assets" trust level and are installable.
     const scriptBearing = catalogSkills.filter((skill) => skill.trustLevel === "scripts_executables");
     expect(scriptBearing.map((skill) => skill.key)).toEqual([
+      "paperclipai/optional/memory/agentmem",
       "paperclipai/optional/research/last30days",
     ]);
   });
