@@ -118,6 +118,12 @@ function cloneRecord(value: unknown): Record<string, unknown> | null {
   return { ...value };
 }
 
+function readWorkspaceRealizationProjectWorkspaceId(metadata: Record<string, unknown> | null): string | null {
+  const realization = isRecord(metadata?.workspaceRealization) ? metadata.workspaceRealization : null;
+  const local = isRecord(realization?.local) ? realization.local : null;
+  return readNullableString(local?.projectWorkspaceId);
+}
+
 function assigneeMatchesExecutionPrincipal(input: {
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
@@ -1603,6 +1609,86 @@ export function executionWorkspaceService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
       return row ? toExecutionWorkspace(row) : null;
+    },
+
+    backfillProjectWorkspaceIdFromRealization: async (id: string) => {
+      const existing = await db
+        .select()
+        .from(executionWorkspaces)
+        .where(eq(executionWorkspaces.id, id))
+        .then((rows) => rows[0] ?? null);
+      if (!existing) throw notFound("Execution workspace not found");
+
+      const metadata = (existing.metadata as Record<string, unknown> | null) ?? null;
+      const realizedProjectWorkspaceId = readWorkspaceRealizationProjectWorkspaceId(metadata);
+      if (!realizedProjectWorkspaceId) {
+        throw unprocessable("Execution workspace has no realized local project workspace id to backfill", {
+          code: "missing_realized_project_workspace_id",
+          workspaceId: id,
+        });
+      }
+
+      const projectWorkspace = await db
+        .select({
+          id: projectWorkspaces.id,
+          companyId: projectWorkspaces.companyId,
+          projectId: projectWorkspaces.projectId,
+        })
+        .from(projectWorkspaces)
+        .where(and(
+          eq(projectWorkspaces.id, realizedProjectWorkspaceId),
+          eq(projectWorkspaces.companyId, existing.companyId),
+        ))
+        .then((rows) => rows[0] ?? null);
+
+      if (!projectWorkspace || projectWorkspace.projectId !== existing.projectId) {
+        throw unprocessable("Realized project workspace does not match the execution workspace project", {
+          code: "realized_project_workspace_mismatch",
+          workspaceId: id,
+          projectId: existing.projectId,
+          realizedProjectWorkspaceId,
+          realizedProjectWorkspaceProjectId: projectWorkspace?.projectId ?? null,
+        });
+      }
+
+      if (existing.projectWorkspaceId) {
+        if (existing.projectWorkspaceId !== realizedProjectWorkspaceId) {
+          throw conflict("Execution workspace already points at a different project workspace", {
+            workspaceId: id,
+            currentProjectWorkspaceId: existing.projectWorkspaceId,
+            realizedProjectWorkspaceId,
+          });
+        }
+        return {
+          workspace: toExecutionWorkspace(existing),
+          backfilled: false,
+          projectWorkspaceId: realizedProjectWorkspaceId,
+        };
+      }
+
+      const row = await db
+        .update(executionWorkspaces)
+        .set({
+          projectWorkspaceId: realizedProjectWorkspaceId,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(executionWorkspaces.id, id),
+          isNull(executionWorkspaces.projectWorkspaceId),
+        ))
+        .returning()
+        .then((rows) => rows[0] ?? null);
+
+      if (!row) throw conflict("Execution workspace project workspace changed during backfill; retry with the latest workspace state", {
+        workspaceId: id,
+        realizedProjectWorkspaceId,
+      });
+
+      return {
+        workspace: toExecutionWorkspace(row),
+        backfilled: true,
+        projectWorkspaceId: realizedProjectWorkspaceId,
+      };
     },
 
     reconcileExecutionWorkspaceBranch: async (

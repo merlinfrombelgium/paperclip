@@ -421,6 +421,145 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     expect(readExecutionWorkspaceConfig(byId.get(untouchedWorkspaceId) ?? null)).toBeNull();
   });
 
+  it("backfills projectWorkspaceId from matching workspace realization metadata", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const projectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Workspace backfill",
+      status: "in_progress",
+    });
+    await db.insert(projectWorkspaces).values({
+      id: projectWorkspaceId,
+      companyId,
+      projectId,
+      name: "Primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: "/tmp/paperclip-primary",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Feature workspace",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: "/tmp/paperclip-worktree",
+      metadata: {
+        workspaceRealization: {
+          version: 1,
+          transport: "local",
+          local: {
+            path: "/tmp/paperclip-worktree",
+            projectId,
+            projectWorkspaceId,
+          },
+        },
+      },
+    });
+
+    const result = await svc.backfillProjectWorkspaceIdFromRealization(executionWorkspaceId);
+
+    expect(result).toMatchObject({
+      backfilled: true,
+      projectWorkspaceId,
+      workspace: {
+        id: executionWorkspaceId,
+        projectWorkspaceId,
+      },
+    });
+
+    const [row] = await db
+      .select({ projectWorkspaceId: executionWorkspaces.projectWorkspaceId })
+      .from(executionWorkspaces)
+      .where(eq(executionWorkspaces.id, executionWorkspaceId));
+    expect(row?.projectWorkspaceId).toBe(projectWorkspaceId);
+  });
+
+  it("rejects projectWorkspaceId backfill when realization metadata points at another project", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const otherProjectId = randomUUID();
+    const otherProjectWorkspaceId = randomUUID();
+    const executionWorkspaceId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: "PAP",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(projects).values([
+      {
+        id: projectId,
+        companyId,
+        name: "Workspace backfill",
+        status: "in_progress",
+      },
+      {
+        id: otherProjectId,
+        companyId,
+        name: "Other project",
+        status: "in_progress",
+      },
+    ]);
+    await db.insert(projectWorkspaces).values({
+      id: otherProjectWorkspaceId,
+      companyId,
+      projectId: otherProjectId,
+      name: "Other primary",
+      sourceType: "local_path",
+      isPrimary: true,
+      cwd: "/tmp/paperclip-other",
+    });
+    await db.insert(executionWorkspaces).values({
+      id: executionWorkspaceId,
+      companyId,
+      projectId,
+      projectWorkspaceId: null,
+      mode: "isolated_workspace",
+      strategyType: "git_worktree",
+      name: "Feature workspace",
+      status: "active",
+      providerType: "git_worktree",
+      cwd: "/tmp/paperclip-worktree",
+      metadata: {
+        workspaceRealization: {
+          version: 1,
+          transport: "local",
+          local: {
+            path: "/tmp/paperclip-worktree",
+            projectId,
+            projectWorkspaceId: otherProjectWorkspaceId,
+          },
+        },
+      },
+    });
+
+    await expect(svc.backfillProjectWorkspaceIdFromRealization(executionWorkspaceId)).rejects.toMatchObject({
+      status: 422,
+      details: expect.objectContaining({
+        code: "realized_project_workspace_mismatch",
+        realizedProjectWorkspaceId: otherProjectWorkspaceId,
+        realizedProjectWorkspaceProjectId: otherProjectId,
+      }),
+    });
+  });
+
   it("limits reusable summaries to open non-shared execution workspaces", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

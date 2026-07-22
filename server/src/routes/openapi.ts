@@ -4314,6 +4314,17 @@ registry.registerPath({
 
 registry.registerPath({
   method: "post",
+  path: "/api/execution-workspaces/{id}/runtime-services/backfill-project-workspace",
+  tags: ["execution-workspaces"],
+  summary: "Backfill an execution workspace project workspace id from validated realization metadata",
+  request: {
+    params: z.object({ id: z.string() }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 409: r.conflict, 422: r.unprocessable },
+});
+
+registry.registerPath({
+  method: "post",
   path: "/api/execution-workspaces/{id}/runtime-services/{action}",
   tags: ["execution-workspaces"],
   summary: "Control a runtime service in a workspace",

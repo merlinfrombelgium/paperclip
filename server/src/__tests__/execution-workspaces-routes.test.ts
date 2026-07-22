@@ -10,6 +10,7 @@ const mockExecutionWorkspaceService = vi.hoisted(() => ({
   listSummaries: vi.fn(),
   getById: vi.fn(),
   getCloseReadiness: vi.fn(),
+  backfillProjectWorkspaceIdFromRealization: vi.fn(),
   reconcileExecutionWorkspaceBranch: vi.fn(),
   update: vi.fn(),
 }));
@@ -27,6 +28,7 @@ const mockAccessService = vi.hoisted(() => ({
   decide: vi.fn(),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockAssertCanManageExecutionWorkspaceRuntimeServices = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../services/index.js", () => ({
   accessService: () => mockAccessService,
@@ -34,6 +36,10 @@ vi.mock("../services/index.js", () => ({
   heartbeatService: () => mockHeartbeatService,
   logActivity: mockLogActivity,
   workspaceOperationService: () => mockWorkspaceOperationService,
+}));
+
+vi.mock("../routes/workspace-runtime-service-authz.js", () => ({
+  assertCanManageExecutionWorkspaceRuntimeServices: mockAssertCanManageExecutionWorkspaceRuntimeServices,
 }));
 
 function createApp(actor: Record<string, unknown> = {
@@ -81,8 +87,10 @@ describe.sequential("execution workspace routes", () => {
       },
     ]);
     mockExecutionWorkspaceService.getById.mockResolvedValue(null);
+    mockExecutionWorkspaceService.backfillProjectWorkspaceIdFromRealization.mockResolvedValue(null);
     mockExecutionWorkspaceService.reconcileExecutionWorkspaceBranch.mockResolvedValue(null);
     mockHeartbeatService.wakeup.mockResolvedValue(null);
+    mockAssertCanManageExecutionWorkspaceRuntimeServices.mockResolvedValue(undefined);
   });
 
   it("uses summary mode for lightweight workspace lookups", async () => {
@@ -134,6 +142,60 @@ describe.sequential("execution workspace routes", () => {
 
     expect(res.status).toBe(422);
     expect(mockExecutionWorkspaceService.listOverview).not.toHaveBeenCalled();
+  });
+
+  it("allows agent actors to backfill project workspace id from realization metadata", async () => {
+    mockExecutionWorkspaceService.getById.mockResolvedValue({
+      id: "workspace-1",
+      companyId: "company-1",
+      sourceIssueId: "issue-1",
+    });
+    mockExecutionWorkspaceService.backfillProjectWorkspaceIdFromRealization.mockResolvedValue({
+      workspace: {
+        id: "workspace-1",
+        companyId: "company-1",
+        projectWorkspaceId: "project-workspace-1",
+      },
+      backfilled: true,
+      projectWorkspaceId: "project-workspace-1",
+    });
+
+    const res = await request(createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_jwt",
+      runId: "run-1",
+    }))
+      .post("/api/execution-workspaces/workspace-1/runtime-services/backfill-project-workspace")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      workspace: {
+        id: "workspace-1",
+        companyId: "company-1",
+        projectWorkspaceId: "project-workspace-1",
+      },
+      backfilled: true,
+      projectWorkspaceId: "project-workspace-1",
+    });
+    expect(mockAssertCanManageExecutionWorkspaceRuntimeServices).toHaveBeenCalledWith(expect.anything(), expect.anything(), {
+      companyId: "company-1",
+      executionWorkspaceId: "workspace-1",
+      sourceIssueId: "issue-1",
+    });
+    expect(mockExecutionWorkspaceService.backfillProjectWorkspaceIdFromRealization).toHaveBeenCalledWith("workspace-1");
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "execution_workspace.project_workspace_backfilled",
+      entityType: "execution_workspace",
+      entityId: "workspace-1",
+      details: expect.objectContaining({
+        backfilled: true,
+        projectWorkspaceId: "project-workspace-1",
+        source: "workspaceRealization.local.projectWorkspaceId",
+      }),
+    }));
   });
 
   it.each([

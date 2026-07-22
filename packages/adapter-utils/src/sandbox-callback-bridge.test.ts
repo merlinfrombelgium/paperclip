@@ -915,6 +915,7 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/start" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/stop" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/restart" },
+      { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/backfill-project-workspace" },
       { method: "GET", path: "/api/routines/r-1" },
       { method: "GET", path: "/api/routines/r-1/runs" },
       { method: "POST", path: "/api/companies/co-1/routines" },
@@ -930,9 +931,9 @@ describe("sandbox callback bridge", () => {
 
     const denied: Array<{ method: string; path: string }> = [
       { method: "DELETE", path: "/api/secrets" },
-      // Pin the runtime-services regex to start/stop/restart only — anything
-      // else (delete, reset, wipe, etc.) must stay denied even if the API
-      // grows new actions later.
+      // Pin the runtime-services regex to explicitly allowed actions only —
+      // anything else (delete, reset, wipe, etc.) must stay denied even if the
+      // API grows new actions later.
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/delete" },
       { method: "POST", path: "/api/companies/co-1/agents" },
       { method: "POST", path: "/api/agents/agent-1/pause" },

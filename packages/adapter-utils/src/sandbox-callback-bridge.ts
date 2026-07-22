@@ -89,7 +89,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
 
   // Execution workspaces and runtime services (start/stop/restart dev servers)
   { method: "GET", path: /^\/api\/execution-workspaces\/[^/]+$/ },
-  { method: "POST", path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
+  { method: "POST", path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart|backfill-project-workspace)$/ },
 
   // Routines (agents manage their own routines and triggers)
   { method: "GET", path: /^\/api\/routines\/[^/]+$/ },
