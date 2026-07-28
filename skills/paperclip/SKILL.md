@@ -67,7 +67,14 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
-**Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
+**Step 6 — Understand context.**
+
+**First, recall durable memory — before any external fetch.** Before you call `heartbeat-context`, hit any external system (Gmail, web search, third-party APIs), or start broad repo exploration, check for and skim your durable memory store. If `$AGENT_HOME/memory/MEMORY.md` exists, read it first: it is the always-loaded index of "do not re-derive this" facts and points at deeper memory files. Skim it (plus any linked files it names that are relevant to this issue) and let it change what you do this heartbeat before you spend a fetch. If the directory is absent or empty, note that and continue.
+
+- **Durable store = `$AGENT_HOME/memory/`.** `AGENT_HOME` is your stable, per-agent home directory; it is the same across heartbeats regardless of run id or workspace source (`project_primary`, `task_session`, or `agent_home`). Read **and** write durable memory (MEMORY.md and its linked files) only there.
+- **Do NOT use the generic auto-memory path `~/.claude/projects/<url-encoded-cwd>/memory/`.** Under Paperclip's per-run execution model the working directory carries a fresh run id every heartbeat, so that path is a brand-new empty directory each run and never persists. It is the ephemeral trap, not your store.
+
+Then gather issue context. Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
 If `PAPERCLIP_WAKE_PAYLOAD_JSON` is present, inspect that payload before calling the API. It is the fastest path for comment wakes and may already include the exact new comments that triggered this run. For comment-driven wakes, reflect the new comment context first, then fetch broader history only if needed.
 
