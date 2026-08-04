@@ -1621,7 +1621,9 @@ describe("agent issue mutation checkout ownership", () => {
       }));
       // A pending interaction is a valid review path, so the agent in_review guard
       // is satisfied — this isolates the test to the watchdog boundary grant.
-      mockIssueThreadInteractionService.listForIssue.mockResolvedValue([{ status: "pending" }] as never);
+      mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
+        { status: "pending", continuationPolicy: "wake_assignee" },
+      ] as never);
 
       const app = await createApp(watchdogActor(), createWatchdogDb());
       const res = await request(app).patch(`/api/issues/${issueId}`).send({ status: "in_review" });

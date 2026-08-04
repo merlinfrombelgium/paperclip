@@ -3309,6 +3309,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         executionState: issues.executionState,
         monitorNextCheckAt: issues.monitorNextCheckAt,
         monitorAttemptCount: issues.monitorAttemptCount,
+        updatedAt: issues.updatedAt,
       })
       .from(issues)
       .where(
@@ -3389,14 +3390,19 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           companyId: issueThreadInteractions.companyId,
           issueId: issueThreadInteractions.issueId,
           status: issueThreadInteractions.status,
+          updatedAt: issueThreadInteractions.updatedAt,
         })
         .from(issueThreadInteractions)
-        .where(eq(issueThreadInteractions.status, "pending")),
+        .where(and(
+          eq(issueThreadInteractions.status, "pending"),
+          inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+        )),
       db
         .select({
           companyId: issueApprovals.companyId,
           issueId: issueApprovals.issueId,
           status: approvals.status,
+          updatedAt: approvals.updatedAt,
         })
         .from(issueApprovals)
         .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))

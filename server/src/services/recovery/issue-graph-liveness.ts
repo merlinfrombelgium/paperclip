@@ -9,7 +9,11 @@ export type IssueLivenessState =
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
   | "invalid_review_participant"
+  | "in_review_stale_waiting_path"
   | "in_review_without_action_path";
+
+export const DEFAULT_IN_REVIEW_STALE_WAIT_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_IN_REVIEW_HARD_ESCALATE_MS = 14 * 24 * 60 * 60 * 1000;
 
 export interface IssueLivenessIssueInput {
   id: string;
@@ -28,6 +32,7 @@ export interface IssueLivenessIssueInput {
   executionState?: Record<string, unknown> | null;
   monitorNextCheckAt?: Date | string | null;
   monitorAttemptCount?: number | null;
+  updatedAt?: Date | string | null;
 }
 
 export interface IssueLivenessRelationInput {
@@ -57,6 +62,7 @@ export interface IssueLivenessWaitingPathInput {
   companyId: string;
   issueId: string;
   status: string;
+  updatedAt?: Date | string | null;
 }
 
 export interface IssueLivenessDependencyPathEntry {
@@ -105,6 +111,8 @@ export interface IssueGraphLivenessInput {
   pendingApprovals?: IssueLivenessWaitingPathInput[];
   openRecoveryIssues?: IssueLivenessWaitingPathInput[];
   now?: Date | string;
+  inReviewStaleWaitMs?: number;
+  inReviewHardEscalateMs?: number;
 }
 
 function issueLabel(issue: IssueLivenessIssueInput) {
@@ -358,6 +366,14 @@ function finding(input: {
 
 export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): IssueLivenessFinding[] {
   const nowMs = readDateMs(input.now ?? new Date()) ?? Date.now();
+  const staleWaitMs = typeof input.inReviewStaleWaitMs === "number" && input.inReviewStaleWaitMs > 0
+    ? input.inReviewStaleWaitMs
+    : DEFAULT_IN_REVIEW_STALE_WAIT_MS;
+  const configuredHardEscalateMs = typeof input.inReviewHardEscalateMs === "number" &&
+    input.inReviewHardEscalateMs > 0
+    ? input.inReviewHardEscalateMs
+    : DEFAULT_IN_REVIEW_HARD_ESCALATE_MS;
+  const hardEscalateMs = Math.max(staleWaitMs, configuredHardEscalateMs);
   const issuesById = new Map(input.issues.map((issue) => [issue.id, issue]));
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const blockersByBlockedIssueId = new Map<string, IssueLivenessRelationInput[]>();
@@ -414,7 +430,6 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
     if (reviewIssue.status !== "in_review") return null;
-    if (hasExplicitWaitingPath(reviewIssue)) return null;
 
     const ownerCandidates = ownerCandidatesForRecoveryIssue(reviewIssue, input.agents, agentsById, {
       includeStalledAssignee: true,
@@ -422,6 +437,48 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
 
     const participant = reviewIssue.executionState?.currentParticipant;
     const participantAgentId = readPrincipalAgentId(participant);
+    const participantUserIsResolvable = principalIsResolvableUser(participant);
+    const hasNonHumanWaitingPath = hasScheduledMonitor(reviewIssue, nowMs) ||
+      hasActiveExecutionPath(reviewIssue.companyId, reviewIssue.id, activeRuns, queuedWakeRequests) ||
+      hasWaitingPath(reviewIssue.companyId, reviewIssue.id, openRecoveryIssues) ||
+      Boolean(participantAgentId && isInvokableAgent(agentsById.get(participantAgentId), agentsById));
+    const humanWaitingPathDates = [
+      reviewIssue.assigneeUserId || participantUserIsResolvable ? readDateMs(reviewIssue.updatedAt) : null,
+      ...pendingInteractions
+        .filter((entry) => entry.companyId === reviewIssue.companyId && entry.issueId === reviewIssue.id)
+        .map((entry) => readDateMs(entry.updatedAt)),
+      ...pendingApprovals
+        .filter((entry) => entry.companyId === reviewIssue.companyId && entry.issueId === reviewIssue.id)
+        .map((entry) => readDateMs(entry.updatedAt)),
+    ].filter((value): value is number => value !== null);
+    const lastHumanWaitChangeMs = humanWaitingPathDates.length > 0
+      ? Math.max(...humanWaitingPathDates)
+      : null;
+
+    if (!hasNonHumanWaitingPath && lastHumanWaitChangeMs !== null) {
+      const waitingAgeMs = nowMs - lastHumanWaitChangeMs;
+      if (waitingAgeMs >= staleWaitMs) {
+        const hardEscalation = waitingAgeMs >= hardEscalateMs;
+        const waitingDays = Math.floor(waitingAgeMs / (24 * 60 * 60 * 1000));
+        return finding({
+          issue: source,
+          state: "in_review_stale_waiting_path",
+          severity: hardEscalation ? "critical" : "warning",
+          reason: `${issueLabel(reviewIssue)} has a valid human or board-gated review path, but it has not changed state for ${waitingDays} days.`,
+          dependencyPath,
+          recoveryIssue: reviewIssue,
+          recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+          recommendedOwnerCandidates: ownerCandidates,
+          recommendedAction: hardEscalation
+            ? `Hard-escalate ${issueLabel(reviewIssue)}'s stale waiting path: re-surface the single pending decision or reclassify the issue.`
+            : `Re-surface ${issueLabel(reviewIssue)}'s pending decision or reclassify the issue before the waiting path becomes a hard escalation.`,
+          blockerIssueId: reviewIssue.id,
+        });
+      }
+    }
+
+    if (hasExplicitWaitingPath(reviewIssue)) return null;
+
     if (participantAgentId) {
       const participantAgent = agentsById.get(participantAgentId);
       if (isInvokableAgent(participantAgent, agentsById) && participantAgent?.companyId === reviewIssue.companyId) return null;
@@ -442,7 +499,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (principalIsResolvableUser(participant)) return null;
+    if (participantUserIsResolvable) return null;
 
     if (reviewIssue.executionState) {
       return finding({

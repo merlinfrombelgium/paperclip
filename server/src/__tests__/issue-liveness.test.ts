@@ -492,6 +492,93 @@ describe("issue graph liveness classifier", () => {
     }
   });
 
+  it("flags stale human-gated in_review paths without treating them as pathless", () => {
+    const reviewIssueId = "review-1";
+    const now = new Date("2026-08-15T00:00:00.000Z");
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "PAP-2279",
+          title: "Board acceptance review",
+          status: "in_review",
+          updatedAt: "2026-08-01T00:00:00.000Z",
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [{
+        companyId,
+        issueId: reviewIssueId,
+        status: "pending",
+        updatedAt: "2026-08-06T00:00:00.000Z",
+      }],
+      now,
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "in_review_stale_waiting_path",
+      severity: "warning",
+      recoveryIssueId: reviewIssueId,
+    });
+    expect(findings[0]?.reason).toContain("9 days");
+  });
+
+  it("hard-escalates a human-gated wait at 14 days and honors configurable bounds", () => {
+    const reviewIssueId = "review-1";
+    const baseInput = {
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "PAP-2279",
+          title: "Board acceptance review",
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: "board-user-1",
+          updatedAt: "2026-08-01T00:00:00.000Z",
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+      now: new Date("2026-08-15T00:00:00.000Z"),
+    };
+
+    expect(classifyIssueGraphLiveness(baseInput)[0]).toMatchObject({
+      state: "in_review_stale_waiting_path",
+      severity: "critical",
+    });
+    expect(classifyIssueGraphLiveness({
+      ...baseInput,
+      inReviewStaleWaitMs: 15 * 24 * 60 * 60 * 1000,
+    })).toEqual([]);
+  });
+
+  it("does not flag an old human wait when a non-human continuation path is live", () => {
+    const reviewIssueId = "review-1";
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          status: "in_review",
+          updatedAt: "2026-07-01T00:00:00.000Z",
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+      pendingApprovals: [{
+        companyId,
+        issueId: reviewIssueId,
+        status: "pending",
+        updatedAt: "2026-07-01T00:00:00.000Z",
+      }],
+      activeRuns: [{ companyId, issueId: reviewIssueId, agentId: coderId, status: "running" }],
+      now: new Date("2026-08-15T00:00:00.000Z"),
+    });
+
+    expect(findings).toEqual([]);
+  });
+
   it("ignores cross-company waiting paths for stalled in_review issues", () => {
     const reviewIssueId = "review-1";
 

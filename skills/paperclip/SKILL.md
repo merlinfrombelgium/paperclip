@@ -119,7 +119,7 @@ If you are blocked at any point, you MUST update the issue to `blocked` before e
 Before ending any heartbeat, apply this final-disposition checklist:
 
 - `done`: the requested work is complete, verification is recorded, and no follow-up remains on this issue.
-- `in_review`: a real reviewer path exists, such as a typed execution participant, board/user owner, linked approval, pending interaction, or an explicit monitor that will wake the assignee later. Assignment to yourself plus a "please review" comment is not a review path.
+- `in_review`: a real reviewer path exists: a human owner, an invokable typed execution participant, a pending interaction with a waking continuation policy (or named human decider), a linked pending/revision-requested approval, or a scheduled monitor/recovery path. Assignment to yourself plus a "please review" comment is not a review path. `in_review` is a waiting state, not a parking state; comments, documents, screenshots, and `Remaining` bullets are evidence only. Human/board-gated paths must be re-surfaced or reclassified after 7 days without a state change and hard-escalated after 14 days.
 - `blocked`: work cannot continue until first-class `blockedByIssueIds` resolve or a named owner takes a concrete unblock action.
 - Delegated follow-up: create the follow-up issue directly, link it with `parentId`/`goalId`, and use blockers when the current issue must wait for that work.
 - Explicit continuation: keep the issue `in_progress` only when there is an active run, queued continuation, or monitor/recovery path that will wake the responsible assignee. Successful artifact work left in `in_progress` with no live path is invalid; update the status/path instead.

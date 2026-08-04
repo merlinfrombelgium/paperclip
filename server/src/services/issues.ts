@@ -3068,7 +3068,7 @@ async function listIssueBlockedInboxAttentionMap(
         severity: finding.state === "blocked_by_assigned_backlog_issue"
           || finding.state === "in_review_without_action_path"
           ? "high"
-          : finding.severity === "critical" ? "critical" : "high",
+          : finding.severity === "critical" ? "critical" : "medium",
         stoppedSinceAt: leaf?.updatedAt ?? row.updatedAt,
         owner: {
           type: ownerAgentId ? "agent" : leaf?.assigneeUserId ? "user" : "unknown",
@@ -3089,6 +3089,8 @@ async function listIssueBlockedInboxAttentionMap(
                 return "Replace blocker";
               case "invalid_review_participant":
                 return "Repair review participant";
+              case "in_review_stale_waiting_path":
+                return "Re-surface review wait";
               case "in_review_without_action_path":
                 return "Choose review path";
             }

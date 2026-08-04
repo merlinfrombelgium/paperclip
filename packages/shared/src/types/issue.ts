@@ -250,6 +250,7 @@ export type IssueBlockedInboxReason =
   | "blocked_by_cancelled_issue"
   | "blocked_chain_stalled"
   | "invalid_review_participant"
+  | "in_review_stale_waiting_path"
   | "in_review_without_action_path"
   | "missing_successful_run_disposition"
   | "pending_board_decision"
