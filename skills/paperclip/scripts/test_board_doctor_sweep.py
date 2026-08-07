@@ -97,8 +97,16 @@ class FakeBoard:
         return True
 
     def patch_issue(self, issue_id, patch):
-        if self._spend(issue_id, "patch"):
-            self.issues.setdefault(issue_id, {}).update(patch)
+        # Mirrors the shipped route: the field update and the optional `comment` on the
+        # same PATCH are two separate cap observations, both taken before any mutation.
+        fields = {k: v for k, v in patch.items() if k != "comment"}
+        applied = True
+        if fields:
+            applied = self._spend(issue_id, "patch")
+        if patch.get("comment"):
+            applied = self._spend(issue_id, "comment") and applied
+        if applied and fields:
+            self.issues.setdefault(issue_id, {}).update(fields)
         return {"ok": True}
 
     def comment(self, issue_id, body):
@@ -188,6 +196,81 @@ class BudgetTests(unittest.TestCase):
         self.assertIsNotNone(restored)
         self.assertEqual(len(restored.pending), 12)
         self.assertEqual(board.cap - board.writes, 2, "reserve must remain unspent")
+
+
+class WriteCostTests(unittest.TestCase):
+    """A PATCH carrying a comment trips the cap counter twice, so it must cost two.
+
+    Counting it as one is the failure that matters: the engine would think it had spent
+    18 of 20 while the control plane had actually seen 36, and every write past the 20th
+    would be lost once enforcement is live.
+    """
+
+    @staticmethod
+    def _patch_with_comment(n, start=1):
+        items = make_items(n, start=start)
+        for it in items:
+            it.payload = {"status": "blocked", "comment": "repaired by Board Doctor"}
+        return items
+
+    def test_cost_reflects_the_gated_surfaces(self):
+        plain, = make_items(1)
+        self.assertEqual(plain.cost, 1)
+
+        with_comment, = self._patch_with_comment(1)
+        self.assertEqual(with_comment.cost, 2)
+
+        comment_only = WorkItem(key="k", target_issue_id="i", target_identifier="ZIM-1",
+                                op="comment", payload={"body": "hi"})
+        self.assertEqual(comment_only.cost, 1)
+
+        # A PATCH carrying only a comment is a single comment observation, not two.
+        bare = WorkItem(key="k", target_issue_id="i", target_identifier="ZIM-1",
+                        op="patch_issue", payload={"comment": "hi"})
+        self.assertEqual(bare.cost, 1)
+
+    def test_budget_is_charged_in_cap_units_not_items(self):
+        board = make_board(30, cap=20)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", self._patch_with_comment(30), cap=20, reserve=2)
+
+        _, result = sweeper.run()
+
+        # 18 units of budget at 2 units per item = 9 items, 18 real writes.
+        self.assertEqual(result.applied, 9)
+        self.assertEqual(result.writes_used, 18)
+        self.assertEqual(board.writes, 18, "engine's count must match the control plane's")
+        self.assertLess(board.writes, board.cap)
+
+    def test_converges_and_writes_each_target_once_at_two_units_per_item(self):
+        board = make_board(25, cap=20)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", self._patch_with_comment(25), cap=20, reserve=2)
+
+        for _ in range(10):
+            state, result = sweeper.run()
+            board.writes = 0  # new heartbeat, fresh allowance
+            if result.complete:
+                break
+
+        self.assertTrue(result.complete)
+        self.assertEqual(len(state.pending), 0)
+        patched = [e for e in board.write_log if e[1] == "patch"]
+        self.assertEqual(len(patched), 25)
+        self.assertEqual(len(set(patched)), 25, "no target may be patched twice")
+
+    def test_item_costing_more_than_the_budget_is_parked_not_looped(self):
+        board = make_board(2, cap=1)
+        sweeper = Sweeper(board, "source")
+        # budget 1, item cost 2 -- unapplicable, and must not wedge the sweep.
+        sweeper.plan("s1", self._patch_with_comment(2), cap=1, reserve=0)
+
+        state, result = sweeper.run()
+
+        self.assertEqual(result.parked, 2)
+        self.assertTrue(state.complete)
+        self.assertTrue(all(i.state == FAILED_PERMANENT for i in state.items))
+        self.assertEqual(board.writes, 0)
 
 
 class ConvergenceTests(unittest.TestCase):

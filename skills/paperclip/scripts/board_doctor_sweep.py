@@ -19,10 +19,12 @@ Two properties do the real work:
 
 2. **Budget before refusal.** The engine counts its own target-issue writes and stops
    at ``cap - reserve``, rather than relying on catching the platform's refusal. The
-   refusal behaviour at write N+1 is unverified (it may be a clean per-write error, a
-   silent no-op, or a hard abort of the run), so the engine never gets close enough to
-   depend on which one it is. The reserve keeps enough budget to flush the checkpoint
-   and post the status comment.
+   refusal is now known to be a clean, catchable per-write 429 (see the constants
+   below), but staying inside the budget is still the primary mechanism: a refusal
+   costs a wasted round trip and, before the enforcement date, is not even observable.
+
+   Counting is per *gated write*, not per work item -- see ``WorkItem.cost``. A
+   ``patch_issue`` that carries a ``comment`` field trips the counter twice.
 
 Run as a CLI (``plan``/``apply``/``status``/``reset``) or import ``Sweeper`` directly.
 """
@@ -57,7 +59,24 @@ DEFAULT_RESERVE = 1
 
 # The refusal is clean and catchable: HTTP 429 with this code, returned *before* the
 # mutation, so there is no partial write and no run abort. Branch on the code, not prose.
+#
+# Note it cannot be *observed* before CAP_ENFORCE_AT: the shipped code derives
+# ``mode = now >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" : "log_only"`` and returns
+# ``allowed: true`` unconditionally while log_only. Overshooting the cap today is silent;
+# on 2026-08-11 the same sweep starts losing every write past the 20th. So the budget
+# gate, not the refusal handler, is what has to be right.
 CAP_REFUSAL_CODE = "cross_issue_influence_cap_exceeded"
+CAP_ENFORCE_AT = "2026-08-11T00:00:00.000Z"
+
+# Gated write surfaces, read off routes/issues.js in the shipped build. There are exactly
+# three, and PATCH accounts for two of them:
+#   PATCH /api/issues/:id  -> "update" when any field changes, AND a separate "comment"
+#                             observation when the body carries a `comment` field
+#   POST  /api/issues/:id/comments -> "comment"
+# So folding a per-card note into the PATCH does not save budget -- it is two counter
+# trips either way. Issue documents and issue creation are not gated at all.
+COST_UPDATE = 1
+COST_COMMENT = 1
 
 # A single item that keeps failing must not wedge the sweep forever. After this many
 # heartbeats it is parked as failed_permanent and surfaced for board action.
@@ -107,6 +126,24 @@ class WorkItem:
     @property
     def terminal(self) -> bool:
         return self.state in TERMINAL_STATES
+
+    @property
+    def cost(self) -> int:
+        """How many cap units applying this item consumes.
+
+        The counter is per gated write, not per item. A ``patch_issue`` whose payload
+        carries a ``comment`` passes through two separate cap checks on the same request
+        -- one for the field update, one for the comment -- so it costs 2. Counting it as
+        1 would let a 20-item sweep attempt 40 writes and silently lose half of them once
+        enforcement is live.
+        """
+        if self.op == "patch_issue":
+            fields = {k: v for k, v in self.payload.items() if k != "comment"}
+            cost = COST_UPDATE if fields else 0
+            if self.payload.get("comment"):
+                cost += COST_COMMENT
+            return max(1, cost)
+        return COST_COMMENT if self.op == "comment" else 1
 
     def satisfied_by(self, issue: dict[str, Any]) -> bool:
         """True when the live target already shows the repaired state."""
@@ -492,8 +529,21 @@ class Sweeper:
                         on_progress(item, SKIPPED)
                     continue
 
+            # An item costing more than a whole heartbeat's budget can never be applied,
+            # and would otherwise re-trip the gate forever without converging. Park it.
+            if item.cost > budget:
+                item.state = FAILED_PERMANENT
+                item.note = f"item costs {item.cost} cap units, budget is {budget}"
+                item.last_error = item.note
+                result.parked += 1
+                dirty = True
+                if on_progress:
+                    on_progress(item, FAILED_PERMANENT)
+                continue
+
             # Budget gate: stop *before* the write that would trip the cap, not after.
-            if result.writes_used >= budget:
+            # Charged in cap units, so a patch-plus-comment item needs two free.
+            if result.writes_used + item.cost > budget:
                 result.stopped_for_budget = True
                 break
 
@@ -514,7 +564,7 @@ class Sweeper:
                     break
                 # Any other failure did reach the mutation path; assume it was charged,
                 # since the cap charges before the write and never refunds.
-                result.writes_used += 1
+                result.writes_used += item.cost
                 item.attempts += 1
                 result.failed += 1
                 result.errors.append(f"{item.target_identifier}: {exc}")
@@ -526,7 +576,7 @@ class Sweeper:
                         on_progress(item, FAILED_PERMANENT)
                 continue
 
-            result.writes_used += 1
+            result.writes_used += item.cost
             item.state = DONE
             item.applied_at = _utcnow()
             item.last_error = None
