@@ -30,6 +30,30 @@ test('findExistingComment: paginates until it finds the commitperclip comment', 
   ]);
 });
 
+test('findExistingComment: matches the Actions-token fallback author', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 7,
+      user: { login: 'github-actions[bot]' },
+      body: 'Hey @someone!\n\n— commitperclip',
+    },
+  ]), 'token', 'paperclipai/paperclip', 6469);
+
+  assert.equal(comment.id, 7);
+});
+
+test('findExistingComment: ignores a signed comment from an unrelated author', async () => {
+  const comment = await findExistingComment(async () => ([
+    {
+      id: 8,
+      user: { login: 'someone-else' },
+      body: 'Quoting the gate output here\n\n— commitperclip',
+    },
+  ]), 'token', 'paperclipai/paperclip', 6469);
+
+  assert.equal(comment, null);
+});
+
 test('findExistingComment: returns null when no signed comment exists', async () => {
   const comment = await findExistingComment(async () => ([
     {

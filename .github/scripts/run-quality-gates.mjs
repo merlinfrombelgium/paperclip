@@ -19,6 +19,16 @@ import { checkDependencies } from './check-pr-dependencies.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
 
+// Which identity authored the gate comment depends on the token the workflow
+// runs with: the commitperclip app where its key is available, the built-in
+// Actions token on forks that do not hold that key. Both must be recognised or
+// the upsert misses and every push adds another comment.
+const GATE_COMMENT_AUTHORS = new Set([
+  'commitperclip[bot]',
+  'commitperclip',
+  'github-actions[bot]',
+]);
+
 function buildComment(author, failures, informational) {
   if (failures.length === 0 && informational.length === 0) {
     return `✅ All checks passing — ready for Greptile review and maintainer approval.\n\n${COMMENT_SIGNATURE}`;
@@ -55,8 +65,7 @@ export async function findExistingComment(fetchFromGitHub, token, repo, prNumber
     );
 
     const existing = comments.find(
-      c => (c.user.login === 'commitperclip[bot]' || c.user.login === 'commitperclip') &&
-           c.body.includes(COMMENT_SIGNATURE)
+      c => GATE_COMMENT_AUTHORS.has(c.user.login) && c.body.includes(COMMENT_SIGNATURE)
     );
     if (existing) return existing;
 
