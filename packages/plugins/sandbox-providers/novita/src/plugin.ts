@@ -108,21 +108,43 @@ function buildStdinPath(): string {
   return `/tmp/.paperclip-stdin-${randomUUID()}`;
 }
 
+export interface NovitaShellCommand {
+  /** The script handed to `sandbox.commands.run`. Carries no env values. */
+  command: string;
+  /** Env for the command, delivered via the SDK's `envs` option. */
+  envs: Record<string, string>;
+}
+
+/**
+ * Build the sandbox script plus the env to hand `commands.run` separately.
+ *
+ * Env values are deliberately NOT interpolated as `export K=v` lines: the whole
+ * script becomes the sandbox process's argv (readable out of
+ * /proc/<pid>/cmdline by anything already running in that sandbox) and transits
+ * the Novita API, where it may be retained in provider request logs (ZIM-2085).
+ * The SDK's `envs` option carries them in a structured field instead.
+ *
+ * Unlike the E2B provider this script sources no login profiles, so there is no
+ * ordering hazard — nothing runs between the sandbox applying `envs` and the
+ * command starting.
+ */
 export function buildShellCommand(input: {
   command: string;
   args?: string[];
   cwd?: string;
   env?: Record<string, string>;
   stdin?: string;
-}): string {
+}): NovitaShellCommand {
   const envEntries = Object.entries(input.env ?? {});
   for (const [key] of envEntries) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
+  const envs = Object.fromEntries(
+    envEntries.filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
 
-  const exports = envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)};`);
   const argv = [input.command, ...(input.args ?? [])].map(shellQuote).join(" ");
   const stdinPath = typeof input.stdin === "string" ? buildStdinPath() : null;
   const stdin = stdinPath ? `printf '%s' ${singleQuoteForPrintf(input.stdin ?? "")} > ${shellQuote(stdinPath)}` : "";
@@ -136,13 +158,15 @@ export function buildShellCommand(input: {
       "exit $status",
     ]
     : [`exec ${argv}`];
-  return [
-    "set -e",
-    stdin,
-    `cd ${shellQuote(cwd)}`,
-    ...exports,
-    ...commandLines,
-  ].filter(Boolean).join("\n");
+  return {
+    command: [
+      "set -e",
+      stdin,
+      `cd ${shellQuote(cwd)}`,
+      ...commandLines,
+    ].filter(Boolean).join("\n"),
+    envs,
+  };
 }
 
 async function createSandbox(params: PluginEnvironmentAcquireLeaseParams | PluginEnvironmentProbeParams, config: NovitaDriverConfig) {
@@ -238,7 +262,7 @@ async function executeInSandbox(
   params: PluginEnvironmentExecuteParams,
   config: NovitaDriverConfig,
 ): Promise<PluginEnvironmentExecuteResult> {
-  const command = buildShellCommand({
+  const { command, envs } = buildShellCommand({
     command: params.command,
     args: params.args,
     cwd: params.cwd,
@@ -248,6 +272,10 @@ async function executeInSandbox(
   try {
     const result = await sandbox.commands.run(command, {
       cwd: "/",
+      // Env goes in the structured `envs` field, never inlined into `command`
+      // (ZIM-2085). Omitted entirely when empty so the request shape is
+      // unchanged for env-less execs.
+      ...(Object.keys(envs).length > 0 ? { envs } : {}),
       timeoutMs: params.timeoutMs ?? config.timeoutMs,
     });
     return {

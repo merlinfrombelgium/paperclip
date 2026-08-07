@@ -21,37 +21,18 @@
 import { Exec } from "@kubernetes/client-node";
 import { PassThrough } from "node:stream";
 import type { KubeConfig } from "@kubernetes/client-node";
+import { shQuote } from "./pod-exec-env.js";
 
 // Minimal WebSocket-like shape covering what we touch (close()). The full type
 // comes from @kubernetes/client-node's transitive ws/isomorphic-ws dep but
 // importing it directly couples this file to that internal choice.
 type WebSocketLike = { close(): void };
 
-// Single-quote a string for safe interpolation into a sh -c script. Wraps in
-// '...' and escapes any embedded single quotes via '\'' (close, escape, reopen).
-export function shQuote(segment: string): string {
-  return `'${segment.replace(/'/g, "'\\''")}'`;
-}
-
-// Wrap a command so the given env vars are exported before it runs. The Kubernetes
-// exec API has no env field, so the only way to give an exec'd process additional
-// env is to run it under a shell that exports the vars and then `exec`s the real
-// command. PATH is deliberately skipped (the caller's PATH is the orchestrator's,
-// not the sandbox image's, and overriding it would break command resolution), and
-// only valid shell identifiers are exported. Returns the original command unchanged
-// when there is nothing to apply.
-export function wrapCommandWithEnv(
-  command: string[],
-  env: Record<string, string> | undefined | null,
-): string[] {
-  const entries = Object.entries(env && typeof env === "object" ? env : {}).filter(
-    ([key, value]) =>
-      typeof value === "string" && key !== "PATH" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(key),
-  );
-  if (entries.length === 0) return command;
-  const exports = entries.map(([k, v]) => `export ${k}=${shQuote(v)};`).join(" ");
-  return ["/bin/sh", "-c", `${exports} exec ${command.map(shQuote).join(" ")}`];
-}
+// Env delivery lives in pod-exec-env.ts (no k8s client import, so it stays unit
+// testable). Values are staged in a 0600 in-pod file over this exec's stdin —
+// never interpolated into a command string, which would put them in the pod
+// process's argv and in kube-apiserver exec audit logs (ZIM-2085).
+export { shQuote } from "./pod-exec-env.js";
 
 export async function execInPod(
   kc: KubeConfig,

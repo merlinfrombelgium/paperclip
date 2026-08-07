@@ -33,7 +33,15 @@ import {
   sandboxCrOrchestrator,
   SandboxCrTimeoutError,
 } from "./sandbox-cr-orchestrator.js";
-import { execInPod, wrapCommandWithEnv } from "./pod-exec.js";
+import { execInPod } from "./pod-exec.js";
+import {
+  buildEnvFilePath,
+  buildEnvFilePayload,
+  buildEnvFileRemovalCommand,
+  buildEnvFileStagingCommand,
+  selectExecEnvEntries,
+  wrapCommandWithEnvFile,
+} from "./pod-exec-env.js";
 import { checkLeaseResumable, destroyLeaseResources } from "./lease-lifecycle.js";
 import {
   deriveCompanySlug,
@@ -740,7 +748,54 @@ const plugin = definePlugin({
       // OpenCode config, plus helper settings like small_model/provider routing) never
       // reaches the harness, which falls back to its in-image HOME config -> wrong or
       // partial behaviour.
-      const execCommand = wrapCommandWithEnv(baseExecCommand, params.env);
+      //
+      // The values are staged in a 0600 in-pod file over a first exec's stdin
+      // rather than interpolated into the command string, which would put them
+      // in the pod process's argv and in kube-apiserver exec audit logs
+      // (ZIM-2085). Only the file path travels in the command.
+      const envEntries = selectExecEnvEntries(params.env);
+      let envFilePath: string | null = null;
+      if (envEntries.length > 0) {
+        envFilePath = buildEnvFilePath();
+        const stagingTimeoutMs = Math.max(
+          5_000,
+          effectiveTimeoutMs - (Date.now() - executeStartedAt),
+        );
+        try {
+          const stagingResult = await execInPod(
+            kc,
+            namespace,
+            podName,
+            "agent",
+            buildEnvFileStagingCommand(envFilePath),
+            buildEnvFilePayload(envEntries),
+            stagingTimeoutMs,
+          );
+          if (stagingResult.exitCode !== 0) {
+            throw new Error(
+              `env staging exec exited with ${stagingResult.exitCode}: ${stagingResult.stderr.trim()}`,
+            );
+          }
+        } catch (err) {
+          // Never fall through to an exec without the env — the harness would
+          // run against the wrong in-image config and fail confusingly.
+          return {
+            exitCode: null,
+            timedOut: true,
+            stdout: "",
+            stderr: `failed to stage sandbox environment: ${err instanceof Error ? err.message : String(err)}`,
+            metadata: {
+              provider: "kubernetes",
+              backend: "sandbox-cr",
+              namespace,
+              sandboxName: lease.providerLeaseId,
+              podName,
+            },
+          };
+        }
+      }
+
+      const execCommand = wrapCommandWithEnvFile(baseExecCommand, envFilePath);
 
       // Remaining share of the caller's budget after the readiness wait (floor
       // of 5s so an exec attempt is still made when readiness consumed most of
@@ -762,6 +817,19 @@ const plugin = definePlugin({
           remainingTimeoutMs,
         );
       } catch (err) {
+        // The wrapped command deletes the env file as soon as it sources it, so
+        // a leftover only exists when the exec never got that far.
+        if (envFilePath) {
+          await execInPod(
+            kc,
+            namespace,
+            podName,
+            "agent",
+            buildEnvFileRemovalCommand(envFilePath),
+            undefined,
+            10_000,
+          ).catch(() => undefined);
+        }
         // Watchdog-fired or WebSocket-setup error. Surface as a timeout so
         // the caller can retry instead of hanging forever.
         return {

@@ -62,8 +62,8 @@ describe("Novita sandbox provider plugin", () => {
     });
   });
 
-  it("builds a quoted shell command with cwd, env, args, and stdin", () => {
-    const command = buildShellCommand({
+  it("builds a quoted shell command with cwd, args, and stdin", () => {
+    const { command } = buildShellCommand({
       command: "node",
       args: ["-e", "console.log(process.env.MESSAGE)"],
       cwd: "/workspace/project",
@@ -72,7 +72,6 @@ describe("Novita sandbox provider plugin", () => {
     });
 
     expect(command).toContain("cd '/workspace/project'");
-    expect(command).toContain("export MESSAGE='hello world';");
     expect(command).toContain("'node' '-e' 'console.log(process.env.MESSAGE)'");
     expect(command).toContain("printf '%s' 'input body' > '/tmp/.paperclip-stdin-");
     expect(command).toMatch(/< '\/tmp\/\.paperclip-stdin-[^']+'/);
@@ -80,8 +79,35 @@ describe("Novita sandbox provider plugin", () => {
     expect(command).toContain("exit $status");
   });
 
+  /**
+   * Regression gate for ZIM-2085 (sentinel shape borrowed from
+   * packages/adapter-utils/src/ssh-env-argv.test.ts).
+   *
+   * The script becomes the sandbox process's argv and transits the Novita API,
+   * so no env VALUE may appear in it. Key names are fine.
+   */
+  it("keeps env values out of the transmitted command string", () => {
+    const SENTINEL = "sk-zim2085-sentinel-do-not-leak";
+    const { command, envs } = buildShellCommand({
+      command: "node",
+      args: ["-e", "console.log(1)"],
+      cwd: "/workspace/project",
+      env: { ANTHROPIC_API_KEY: SENTINEL },
+    });
+
+    expect(command).not.toContain(SENTINEL);
+    expect(command).not.toContain("export ANTHROPIC_API_KEY");
+    // …and it still gets delivered, via the structured field.
+    expect(envs).toEqual({ ANTHROPIC_API_KEY: SENTINEL });
+  });
+
+  it("returns no envs when there is nothing to pass", () => {
+    expect(buildShellCommand({ command: "true" }).envs).toEqual({});
+    expect(buildShellCommand({ command: "true", env: {} }).envs).toEqual({});
+  });
+
   it("does not use a heredoc delimiter for stdin", () => {
-    const command = buildShellCommand({
+    const { command } = buildShellCommand({
       command: "cat",
       stdin: "before\nPAPERCLIP_STDIN\nafter",
     });
@@ -91,11 +117,11 @@ describe("Novita sandbox provider plugin", () => {
   });
 
   it("uses a unique stdin path for each command", () => {
-    const first = buildShellCommand({
+    const { command: first } = buildShellCommand({
       command: "cat",
       stdin: "first",
     });
-    const second = buildShellCommand({
+    const { command: second } = buildShellCommand({
       command: "cat",
       stdin: "second",
     });

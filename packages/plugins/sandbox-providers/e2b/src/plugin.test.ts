@@ -307,9 +307,14 @@ describe("E2B sandbox provider plugin", () => {
     expect(stdinCall).toBeDefined();
     if (!stdinCall) throw new Error("stdinCall not found");
     expect(stdinCall[0]).toMatch(/\.profile/);
-    expect(stdinCall[0]).toMatch(/exec env FOO='bar' 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
-    expect(stdinCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
-    expect(stdinCall[1]).not.toHaveProperty("envs");
+    expect(stdinCall[0]).toMatch(/exec 'printf' 'hello' < '\/tmp\/paperclip-stdin-/);
+    // Env is applied after profile sourcing, from the prefixed carrier.
+    expect(stdinCall[0]).toContain('export FOO="$PAPERCLIP_ENV_IN_FOO" && unset PAPERCLIP_ENV_IN_FOO');
+    expect(stdinCall[1]).toEqual(expect.objectContaining({
+      cwd: "/workspace",
+      timeoutMs: 1000,
+      envs: { PAPERCLIP_ENV_IN_FOO: "bar" },
+    }));
     expect(stdinCall[1]).not.toHaveProperty("background");
     expect(sandbox.commands.sendStdin).not.toHaveBeenCalled();
     expect(sandbox.commands.closeStdin).not.toHaveBeenCalled();
@@ -364,9 +369,13 @@ describe("E2B sandbox provider plugin", () => {
     expect(fgCall).toBeDefined();
     if (!fgCall) throw new Error("fgCall not found");
     expect(fgCall[0]).toMatch(/\.profile/);
-    expect(fgCall[0]).toMatch(/exec env FOO='bar' 'printf' 'hello'$/);
-    expect(fgCall[1]).toEqual(expect.objectContaining({ cwd: "/workspace", timeoutMs: 1000 }));
-    expect(fgCall[1]).not.toHaveProperty("envs");
+    expect(fgCall[0]).toMatch(/exec 'printf' 'hello'$/);
+    expect(fgCall[0]).toContain('export FOO="$PAPERCLIP_ENV_IN_FOO" && unset PAPERCLIP_ENV_IN_FOO');
+    expect(fgCall[1]).toEqual(expect.objectContaining({
+      cwd: "/workspace",
+      timeoutMs: 1000,
+      envs: { PAPERCLIP_ENV_IN_FOO: "bar" },
+    }));
     expect(fgCall[1]).not.toHaveProperty("background");
     expect(sandbox.commands.sendStdin).not.toHaveBeenCalled();
     expect(sandbox.commands.closeStdin).not.toHaveBeenCalled();
@@ -377,6 +386,50 @@ describe("E2B sandbox provider plugin", () => {
       stdout: "foreground\n",
       stderr: "",
     });
+  });
+
+  /**
+   * Regression gate for ZIM-2085 (sentinel shape borrowed from
+   * packages/adapter-utils/src/ssh-env-argv.test.ts).
+   *
+   * The script becomes the sandbox process's argv and transits the E2B API, so
+   * no env VALUE may appear in it. Assertions are on the *value*, never the key
+   * name — the key legitimately appears in the re-export line.
+   */
+  it("keeps env values out of the transmitted command string", async () => {
+    const SENTINEL = "sk-zim2085-sentinel-do-not-leak";
+    const sandbox = createMockSandbox();
+    mockConnect.mockResolvedValue(sandbox);
+
+    await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "e2b",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: {
+        template: "base",
+        apiKey: "resolved-key",
+        timeoutMs: 300000,
+        reuseLease: false,
+      },
+      lease: { providerLeaseId: "sandbox-123", metadata: {} },
+      command: "printf",
+      args: ["hello"],
+      cwd: "/workspace",
+      env: { ANTHROPIC_API_KEY: SENTINEL },
+      timeoutMs: 1000,
+    });
+
+    const commandStrings = sandbox.commands.run.mock.calls.map(([cmd]: [string]) => cmd);
+    expect(commandStrings.length).toBeGreaterThan(0);
+    expect(commandStrings.filter((cmd: string) => cmd.includes(SENTINEL))).toEqual([]);
+
+    // …and it still gets delivered, via the structured field.
+    const execCall = sandbox.commands.run.mock.calls.find(([cmd]: [string]) => cmd.includes("'printf'"));
+    if (!execCall) throw new Error("execCall not found");
+    expect(execCall[1].envs).toEqual({ PAPERCLIP_ENV_IN_ANTHROPIC_API_KEY: SENTINEL });
+    // Applied after profile sourcing so the caller's value wins.
+    const applyIndex = execCall[0].indexOf('export ANTHROPIC_API_KEY="$PAPERCLIP_ENV_IN_ANTHROPIC_API_KEY"');
+    expect(applyIndex).toBeGreaterThan(execCall[0].indexOf("nvm.sh"));
   });
 
   it("refreshes the sandbox lifetime on every execute so long runs don't die mid-command", async () => {

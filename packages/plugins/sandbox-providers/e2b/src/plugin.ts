@@ -152,6 +152,23 @@ function isValidShellEnvKey(value: string) {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+/**
+ * Prefix for the indirection env vars handed to `commands.run({ envs })`.
+ *
+ * See buildLoginShellScript: the caller's env arrives under these prefixed
+ * names and the script re-exports it under the real names *after* profile
+ * sourcing, so the values never enter the command string while the
+ * override-wins ordering is preserved.
+ */
+export const E2B_ENV_INDIRECTION_PREFIX = "PAPERCLIP_ENV_IN_";
+
+export interface E2bShellCommand {
+  /** The script handed to `sandbox.commands.run`. Carries no env values. */
+  script: string;
+  /** Prefixed env for the command, delivered via the SDK's `envs` option. */
+  envs: Record<string, string>;
+}
+
 // Mirror SSH's buildSshSpawnTarget: source the user's login profiles (and nvm)
 // before exec so commands run with the same PATH the user sees in an
 // interactive shell. e2b's `sandbox.commands.run` otherwise spawns a
@@ -159,37 +176,59 @@ function isValidShellEnvKey(value: string) {
 // nvm shims, or anything else the template installs via .profile/.bashrc —
 // which makes the hello probe fail with `exec: <cli>: not found` even when
 // the binary is on disk.
+//
+// Env is NOT interpolated into the script (ZIM-2085). An `exec env KEY=val …`
+// line puts every value in the sandbox process's argv, readable out of
+// /proc/<pid>/cmdline by anything already running in that sandbox, and sends it
+// through the E2B API where it may be retained in provider request logs.
+//
+// It is also not passed under its real names via `envs`, because that applies
+// the env before the script runs and a profile that re-exports an identity var
+// (NVM_DIR / HOME / PATH) would then silently win over the caller's override.
+// Instead the values ride in under a prefix and the script re-exports them
+// under their real names after profile sourcing — same ordering as before, but
+// the script only ever names keys, never values.
 function buildLoginShellScript(input: {
   command: string;
   args: string[];
   env?: Record<string, string>;
-}): string {
+}): E2bShellCommand {
   const env = input.env ?? {};
   for (const key of Object.keys(env)) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  const envEntries = Object.entries(env)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+  const envs = Object.fromEntries(
+    envEntries.map(([key, value]) => [`${E2B_ENV_INDIRECTION_PREFIX}${key}`, value]),
+  );
+  // `export K="$PAPERCLIP_ENV_IN_K" && unset PAPERCLIP_ENV_IN_K` — the value is
+  // copied out of the inherited env, then the carrier is dropped so the child
+  // does not see a duplicate of every secret under a second name.
+  const applyEnvLines = envEntries.map(([key]) => {
+    const carrier = `${E2B_ENV_INDIRECTION_PREFIX}${key}`;
+    return `export ${key}="$${carrier}" && unset ${carrier}`;
+  });
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const execLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}`
-    : `exec ${commandParts}`;
-  return [
-    'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
-    // .bash_profile typically sources .bashrc itself; only source .bashrc
-    // directly when no .bash_profile exists to avoid re-running idempotency-
-    // sensitive setup (nvm, PATH prepends) twice on templates that wire
-    // .bash_profile -> .bashrc.
-    'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
-    'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-    'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
-    '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
-    execLine,
-  ].join(" && ");
+  return {
+    script: [
+      'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
+      'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
+      // .bash_profile typically sources .bashrc itself; only source .bashrc
+      // directly when no .bash_profile exists to avoid re-running idempotency-
+      // sensitive setup (nvm, PATH prepends) twice on templates that wire
+      // .bash_profile -> .bashrc.
+      'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
+      'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
+      'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
+      '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
+      ...applyEnvLines,
+      `exec ${commandParts}`,
+    ].join(" && "),
+    envs,
+  };
 }
 
 async function killSandboxBestEffort(sandbox: Sandbox, reason: string): Promise<void> {
@@ -403,7 +442,7 @@ const plugin = definePlugin({
     } catch {
       // ignore — keep going with the existing sandbox lifetime
     }
-    const baseCommand = buildLoginShellScript({
+    const { script: baseCommand, envs } = buildLoginShellScript({
       command: params.command,
       args: params.args ?? [],
       env: params.env,
@@ -435,11 +474,14 @@ const plugin = definePlugin({
       : baseCommand;
 
     try {
-      // Env is interpolated into the script via `exec env KEY=val …` after
-      // profile sourcing so user-configured env wins over anything profiles
-      // export. No need to pass `envs:` separately.
+      // Env rides in via `envs:` under PAPERCLIP_ENV_IN_-prefixed names; the
+      // script re-exports it under the real names after profile sourcing, so
+      // user-configured env still wins over anything profiles export without
+      // any value appearing in the command string (ZIM-2085). Omitted entirely
+      // when empty so the request shape is unchanged for env-less execs.
       const result = await sandbox.commands.run(command, {
         cwd: params.cwd,
+        ...(Object.keys(envs).length > 0 ? { envs } : {}),
         timeoutMs,
       }) as Awaited<ReturnType<Sandbox["commands"]["run"]>> & {
         exitCode: number;

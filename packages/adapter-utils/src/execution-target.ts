@@ -500,11 +500,13 @@ export async function runAdapterExecutionTargetShellCommand(
     const env = sanitizeRemoteExecutionEnv(options.env);
     if (target.transport === "ssh") {
       try {
-        // Pass the raw command — `runSshCommand` owns profile sourcing and
-        // the outer shell wrapper. Wrapping again here would nest a second
-        // shell after the explicit `env KEY=VAL` overrides, re-sourcing
-        // login profiles AFTER the override and silently undoing any
-        // identity var (NVM_DIR / PATH / etc.) that a profile re-exports.
+        // Pass the raw command — `runSshCommand` owns profile sourcing, env
+        // delivery, and the outer shell wrapper. Wrapping again here would
+        // nest a second shell after the staged env file is sourced,
+        // re-sourcing login profiles AFTER the override and silently undoing
+        // any identity var (NVM_DIR / PATH / etc.) that a profile re-exports.
+        // (The env is staged in a 0600 remote file and sourced, not inlined as
+        // `env KEY=VAL` — see writeRemoteEnvFile in ssh.ts, ZIM-2082.)
         const result = await runSshCommand(target.spec, command, {
           env,
           timeoutMs: (options.timeoutSec ?? 15) * 1000,
