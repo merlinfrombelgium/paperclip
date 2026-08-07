@@ -192,6 +192,7 @@ async function execFileText(
   options: {
     timeout?: number;
     maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
@@ -201,6 +202,7 @@ async function execFileText(
       {
         timeout: options.timeout ?? 15_000,
         maxBuffer: options.maxBuffer ?? 1024 * 128,
+        ...(options.env ? { env: options.env } : {}),
       },
       (error, stdout, stderr) => {
         if (error) {
@@ -223,11 +225,13 @@ async function spawnText(
     stdin?: string;
     timeout?: number;
     maxBuffer?: number;
+    env?: NodeJS.ProcessEnv;
   } = {},
 ): Promise<SshCommandResult> {
   return await new Promise<SshCommandResult>((resolve, reject) => {
     const child = spawn(file, args, {
       stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
+      ...(options.env ? { env: options.env } : {}),
     });
 
     const maxBuffer = options.maxBuffer ?? 1024 * 128;
@@ -368,10 +372,211 @@ async function withTempFile(
   };
 }
 
+/**
+ * Seconds the remote-exec private key stays loaded in its per-invocation agent.
+ *
+ * ssh only consults an identity during connection setup. Bounding the identity
+ * lifetime therefore lets the long-lived session built by `buildSshSpawnTarget`
+ * keep running for hours while the credential itself stops being usable about
+ * two minutes in — which collapses the ZIM-2088 exposure window without having
+ * to detect "connection established". `resolveSpawnTarget` (server-utils.ts)
+ * hands the argv straight to spawn, so 120s is ample today; the pinned
+ * assertion in ssh-agent-identity.test.ts makes a future change that queues
+ * that spawn fail loudly instead of breaking connections intermittently.
+ */
+export const SSH_AGENT_IDENTITY_LIFETIME_SECONDS = 120;
+
+/**
+ * Explicit, loudly-logged opt-in back to the pre-ZIM-2088 on-disk key file.
+ * There is deliberately no silent fallback: a quiet downgrade would reintroduce
+ * the finding invisibly.
+ */
+const ON_DISK_KEY_ESCAPE_HATCH_ENV = "PAPERCLIP_SSH_ALLOW_ONDISK_KEY";
+
+/** Test-only override for {@link SSH_AGENT_IDENTITY_LIFETIME_SECONDS}. */
+const IDENTITY_LIFETIME_OVERRIDE_ENV = "PAPERCLIP_SSH_AGENT_IDENTITY_TTL_SECONDS";
+
+const SSH_AGENT_COMMAND_TIMEOUT_MS = 5_000;
+
+function resolveSshAgentIdentityLifetimeSeconds(): number {
+  const raw = process.env[IDENTITY_LIFETIME_OVERRIDE_ENV]?.trim();
+  if (!raw) return SSH_AGENT_IDENTITY_LIFETIME_SECONDS;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return SSH_AGENT_IDENTITY_LIFETIME_SECONDS;
+  // Clamped: an unbounded identity would be the exact thing this replaces.
+  return Math.min(parsed, 3_600);
+}
+
+function describeProcessError(error: unknown): string {
+  const failure = error as { stderr?: unknown } | null;
+  const stderr = typeof failure?.stderr === "string" ? failure.stderr.trim() : "";
+  if (stderr) return stderr;
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** `SSH_AGENT_PID=12345; export SSH_AGENT_PID;` out of ssh-agent's shell preamble. */
+function parseSshAgentPid(stdout: string): number | null {
+  const match = stdout.match(/SSH_AGENT_PID=(\d+)/);
+  if (!match) return null;
+  const pid = Number.parseInt(match[1]!, 10);
+  return Number.isFinite(pid) && pid > 0 ? pid : null;
+}
+
+interface SshIdentityAgent {
+  socketPath: string;
+  cleanup: () => Promise<void>;
+}
+
+/**
+ * Starts a throwaway ssh-agent, loads `privateKey` into it over stdin, and
+ * returns the socket path.
+ *
+ * The key material never touches a file and never touches argv: `ps` and
+ * `/proc/<pid>/cmdline` see only the socket path, which is not secret, and the
+ * only on-disk artefact is a 0700 directory holding an AF_UNIX socket. That
+ * matters because every agent on a Paperclip host runs as the same `paperclip`
+ * uid, so the old 0600 key file was not a boundary against the actual adversary
+ * (ZIM-2088).
+ */
+async function startSshIdentityAgent(privateKey: string): Promise<SshIdentityAgent> {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-agent-"));
+  // mkdtemp already creates 0700, but this directory is the only thing standing
+  // between the agent socket and every other process sharing this uid, so set
+  // the mode explicitly instead of inheriting a platform default.
+  await fs.chmod(dir, 0o700);
+  // AF_UNIX sun_path caps at ~108 bytes and TMPDIR is already run-scoped and
+  // long here, so keep the socket's leaf name to a single character.
+  const socketPath = path.join(dir, "s");
+
+  const removeDir = async () => {
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+  };
+
+  let startOutput: SshCommandResult;
+  try {
+    startOutput = await execFileText("ssh-agent", ["-a", socketPath], {
+      timeout: SSH_AGENT_COMMAND_TIMEOUT_MS,
+      maxBuffer: 16 * 1024,
+    });
+  } catch (error) {
+    await removeDir();
+    throw new Error(
+      `Failed to start ssh-agent for SSH key authentication (ZIM-2088): ${describeProcessError(error)}`,
+    );
+  }
+
+  const agentPid = parseSshAgentPid(startOutput.stdout);
+  const killAgent = async () => {
+    if (agentPid == null) {
+      // Unreachable with stock OpenSSH. If it ever happens we cannot reap the
+      // process, but the identity is memory-only and self-expires, so degrade
+      // rather than leaving the caller without a working connection.
+      console.warn(
+        "[ssh] ssh-agent did not report SSH_AGENT_PID; cannot kill it explicitly. " +
+          `The loaded identity still expires after ${resolveSshAgentIdentityLifetimeSeconds()}s (ZIM-2088).`,
+      );
+      return;
+    }
+    await execFileText("ssh-agent", ["-k"], {
+      timeout: SSH_AGENT_COMMAND_TIMEOUT_MS,
+      maxBuffer: 16 * 1024,
+      env: { ...process.env, SSH_AUTH_SOCK: socketPath, SSH_AGENT_PID: String(agentPid) },
+    }).catch(() => undefined);
+    if (await isPidRunning(agentPid)) {
+      try {
+        process.kill(agentPid, "SIGKILL");
+      } catch {
+        // Already gone between the check and the signal — fine.
+      }
+    }
+  };
+
+  try {
+    await loadSshAgentIdentity({ socketPath, privateKey });
+  } catch (error) {
+    await killAgent();
+    await removeDir();
+    throw error;
+  }
+
+  return {
+    socketPath,
+    cleanup: async () => {
+      await killAgent();
+      await removeDir();
+    },
+  };
+}
+
+async function loadSshAgentIdentity(input: {
+  socketPath: string;
+  privateKey: string;
+}): Promise<void> {
+  const material = input.privateKey.endsWith("\n") ? input.privateKey : `${input.privateKey}\n`;
+  const env: NodeJS.ProcessEnv = { ...process.env, SSH_AUTH_SOCK: input.socketPath };
+  // An encrypted key would otherwise hang here forever waiting on a passphrase.
+  // Dropping the askpass hooks and closing stdin right after the material (which
+  // spawnText does) makes that case fail fast; the timeout below is the backstop.
+  delete env.DISPLAY;
+  delete env.SSH_ASKPASS;
+
+  try {
+    // `-` reads the key from stdin (OpenSSH >= 8.2): no file, no argv.
+    await spawnText("ssh-add", ["-t", String(resolveSshAgentIdentityLifetimeSeconds()), "-"], {
+      stdin: material,
+      env,
+      timeout: SSH_AGENT_COMMAND_TIMEOUT_MS,
+      maxBuffer: 16 * 1024,
+    });
+  } catch (error) {
+    throw new Error(
+      `Failed to load the SSH private key into ssh-agent (ZIM-2088): ${describeProcessError(error)}`,
+    );
+  }
+}
+
+async function createSshKeyAuthArgs(
+  privateKey: string,
+): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
+  if (process.env[ON_DISK_KEY_ESCAPE_HATCH_ENV] === "1") {
+    console.warn(
+      `[ssh] ${ON_DISK_KEY_ESCAPE_HATCH_ENV}=1: writing the SSH private key to a temp file. ` +
+        "Every agent on this host shares one uid, so 0600 is not a boundary and the key is readable by " +
+        "any of them for as long as the connection lives (ZIM-2088). Unset this to use ssh-agent.",
+    );
+    const keyFile = await withTempFile("paperclip-ssh-key-", privateKey, 0o600);
+    return { args: ["-i", keyFile.path], cleanup: keyFile.cleanup };
+  }
+
+  const missing: string[] = [];
+  for (const command of ["ssh-agent", "ssh-add"]) {
+    if (!(await commandExists(command))) missing.push(command);
+  }
+  if (missing.length > 0) {
+    // Fail closed. These ship in the same openssh-client package as `ssh`
+    // itself, so this is close to unreachable, and a silent fallback to the
+    // on-disk key would reintroduce ZIM-2088 without anyone noticing.
+    throw new Error(
+      `SSH key authentication requires ${missing.join(" and ")} (openssh-client), not found on PATH. ` +
+        "Paperclip no longer writes the private key to disk (ZIM-2088). Install openssh-client, or set " +
+        `${ON_DISK_KEY_ESCAPE_HATCH_ENV}=1 to opt back into the on-disk key with its known exposure.`,
+    );
+  }
+
+  const agent = await startSshIdentityAgent(privateKey);
+  return {
+    // IdentitiesOnly=yes is deliberately absent: it suppresses agent identities
+    // and would leave the connection with no usable key. The socket path is not
+    // secret, so unlike env values (ZIM-2069) it is fine in argv.
+    args: ["-o", `IdentityAgent=${agent.socketPath}`],
+    cleanup: agent.cleanup,
+  };
+}
+
 async function createSshAuthArgs(
   config: Pick<SshConnectionConfig, "privateKey" | "knownHosts" | "strictHostKeyChecking">,
 ): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
-  const tempFiles: Array<() => Promise<void>> = [];
+  const cleanups: Array<() => Promise<void>> = [];
   const sshArgs = [
     "-o",
     "BatchMode=yes",
@@ -381,10 +586,14 @@ async function createSshAuthArgs(
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
   ];
 
+  const cleanup = async () => {
+    await Promise.all(cleanups.map((entry) => entry()));
+  };
+
   if (config.strictHostKeyChecking) {
     if (config.knownHosts) {
       const knownHosts = await withTempFile("paperclip-ssh-known-hosts-", config.knownHosts, 0o600);
-      tempFiles.push(knownHosts.cleanup);
+      cleanups.push(knownHosts.cleanup);
       sshArgs.push("-o", `UserKnownHostsFile=${knownHosts.path}`);
     }
   } else {
@@ -392,17 +601,19 @@ async function createSshAuthArgs(
   }
 
   if (config.privateKey) {
-    const privateKey = await withTempFile("paperclip-ssh-key-", config.privateKey, 0o600);
-    tempFiles.push(privateKey.cleanup);
-    sshArgs.push("-i", privateKey.path);
+    let keyAuth: { args: string[]; cleanup: () => Promise<void> };
+    try {
+      keyAuth = await createSshKeyAuthArgs(config.privateKey);
+    } catch (error) {
+      // Don't strand the known-hosts file when key setup fails.
+      await cleanup();
+      throw error;
+    }
+    cleanups.push(keyAuth.cleanup);
+    sshArgs.push(...keyAuth.args);
   }
 
-  return {
-    args: sshArgs,
-    cleanup: async () => {
-      await Promise.all(tempFiles.map((cleanup) => cleanup()));
-    },
-  };
+  return { args: sshArgs, cleanup };
 }
 
 export interface RemoteEnvFile {
@@ -1198,7 +1409,9 @@ export async function getSshEnvLabSupport(): Promise<SshEnvLabSupport> {
     };
   }
 
-  for (const command of ["ssh", "sshd", "ssh-keygen"]) {
+  // ssh-agent/ssh-add are required because the fixture config always carries a
+  // private key, and key auth now goes through a per-invocation agent (ZIM-2088).
+  for (const command of ["ssh", "sshd", "ssh-keygen", "ssh-agent", "ssh-add"]) {
     if (!(await commandExists(command))) {
       return {
         supported: false,
@@ -1489,7 +1702,16 @@ export async function syncDirectoryFromSsh(input: {
   progressLabel?: string;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
-  const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  // The remote archive below is built with `tar -cf - .`, so it carries a "./"
+  // member whose mode tar restores onto the extraction target — resetting this
+  // 0700 mkdtemp directory to the remote workspace's mode (typically 0755) and
+  // leaving the whole restored checkout world-readable under /tmp for the rest
+  // of the restore. Extract one level down instead: the 0700 root denies
+  // traversal to every other uid regardless of what tar does to the directory
+  // it extracts into, and that holds for GNU tar, bsdtar and busybox tar alike.
+  const stagingRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  const stagingDir = path.join(stagingRoot, "workspace");
+  await fs.mkdir(stagingDir, { mode: 0o700 });
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
     `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
@@ -1518,6 +1740,7 @@ export async function syncDirectoryFromSsh(input: {
     : null;
 
   try {
+    try {
     await new Promise<void>((resolve, reject) => {
       const ssh = spawn("ssh", sshArgs, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -1583,6 +1806,14 @@ export async function syncDirectoryFromSsh(input: {
         maybeFinish();
       });
     });
+    } finally {
+      // Second line of defence behind the staging root: re-tighten the
+      // directory tar just extracted into, on the failure path too, since a
+      // partial extraction leaves the same widened directory behind. Only the
+      // directory itself — the extracted contents keep their remote modes,
+      // which the merge into localDir still needs.
+      await fs.chmod(stagingDir, 0o700).catch(() => undefined);
+    }
     await progress?.finish();
 
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
@@ -1591,7 +1822,7 @@ export async function syncDirectoryFromSsh(input: {
     await progress?.fail();
     throw error;
   } finally {
-    await fs.rm(stagingDir, { recursive: true, force: true }).catch(() => undefined);
+    await fs.rm(stagingRoot, { recursive: true, force: true }).catch(() => undefined);
     await auth.cleanup();
   }
 }
