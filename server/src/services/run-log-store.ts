@@ -2,6 +2,7 @@ import { createReadStream, promises as fs } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { notFound } from "../errors.js";
+import { redactSensitiveText } from "../redaction.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 
 export type RunLogStoreType = "local_file";
@@ -112,7 +113,10 @@ function createLocalFileRunLogStore(basePath: string): RunLogStore {
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        // Redact at the write boundary, not at the caller. Run logs persist
+        // world-readable under a uid every agent shares, so a caller that
+        // forgets to sanitize must not be able to commit a secret to disk.
+        chunk: redactSensitiveText(event.chunk),
       });
       const persisted = `${line}\n`;
       await fs.appendFile(absPath, persisted, "utf8");

@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { redactSensitiveText } from "../redaction.js";
 
 export type WorkspaceOperationLogStoreType = "local_file";
 
@@ -112,7 +113,9 @@ function createLocalFileWorkspaceOperationLogStore(basePath: string): WorkspaceO
       const line = JSON.stringify({
         ts: event.ts,
         stream: event.stream,
-        chunk: event.chunk,
+        // Same write-boundary rule as the run-log store: callers here only
+        // apply the username redactor, so secret redaction has to happen here.
+        chunk: redactSensitiveText(event.chunk),
       });
       await fs.appendFile(absPath, `${line}\n`, "utf8");
     },
