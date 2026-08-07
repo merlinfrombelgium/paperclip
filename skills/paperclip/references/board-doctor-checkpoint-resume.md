@@ -148,6 +148,29 @@ continuation path until the worklist is empty.
 Add new ops in `Sweeper._apply_one`, and give them a `verify` shape wherever the repair is
 observable on the target.
 
+## Budget per card — keep it at 1
+
+The cap counts **gated writes, not cards**, and this is the single biggest lever on how many
+heartbeats a sweep takes. Verified against the shipped build
+(`routes/issues.js`, `assertCrossIssueInfluenceWithinRunCap`): the PATCH handler calls the
+counter **twice on one request** — once with kind `update` when any field changes, and again
+with kind `comment` when the body carries a `comment`. Folding a note into the PATCH does
+**not** make it one write. There is no cheaper combined surface.
+
+So a card repaired with an update *and* a note costs 2, halving the run to 10 cards. The
+78-write sweep takes ~8 heartbeats that way, ~4 at one write per card.
+
+**Rule: one gated write per card.** Patch the fields, and say everything else in a single
+summary comment on the sweep's own source issue — self-writes are free and uncounted, so
+the whole narrative costs nothing. Reserve per-card comments for repairs whose note is the
+entire point and cannot be inferred from the field change.
+
+There is also a sharp edge at the boundary: the two guards run **before** any mutation, so a
+2-cost PATCH that clears the `update` guard and trips on the `comment` guard is charged for
+the update and still writes nothing. `WorkItem.cost` prices patch-plus-comment at 2 and the
+budget gate stops before an item it cannot fully afford, so the engine never straddles the
+cap this way — but hand-rolled writes outside the engine can.
+
 ## Other refusals
 
 Cap budget is not the only reason a write fails. A foreign-issue mutation can still be
