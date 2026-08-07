@@ -5,8 +5,10 @@ Run: python3 -m unittest skills.paperclip.scripts.test_board_doctor_sweep -v
      (or: python3 skills/paperclip/scripts/test_board_doctor_sweep.py)
 
 The fake board below is the point of the exercise: it enforces a hard write cap with a
-selectable refusal mode, because the real platform's behaviour at write N+1 is unverified.
-The engine must converge correctly under every mode.
+selectable refusal mode. The real contract is now known (429 +
+details.code=cross_issue_influence_cap_exceeded, returned before the mutation), but the
+suite keeps the silent-no-op and mid-run-abort modes too -- they cost nothing and pin down
+behaviour if the contract ever shifts.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -329,7 +332,7 @@ class FailureHandlingTests(unittest.TestCase):
         _, result = sweeper.run(state)
 
         self.assertTrue(result.stopped_for_budget)
-        deferred = [i for i in state.items if i.note == "deferred: cap-shaped refusal"]
+        deferred = [i for i in state.items if i.note == "deferred: cap refusal"]
         self.assertEqual(len(deferred), 1)
         self.assertEqual(deferred[0].attempts, 0, "a cap refusal is not the item's fault")
         self.assertEqual(deferred[0].state, PENDING, "deferred item stays on the worklist")
@@ -397,6 +400,40 @@ class CheckpointConcurrencyTests(unittest.TestCase):
         ba = _merge_states(copy.deepcopy(b), copy.deepcopy(a))
 
         self.assertEqual({i.key: i.state for i in ab.items}, {i.key: i.state for i in ba.items})
+
+
+class RefusalClassificationTests(unittest.TestCase):
+    """Pinned to the verified contract (ZIM-2068): 429 + details.code, checked before prose."""
+
+    def _classify(self, status, body):
+        import io
+        import urllib.error
+        from board_doctor_sweep import PaperclipClient
+
+        client = PaperclipClient("http://x", "k")
+        err = urllib.error.HTTPError("http://x", status, "err", {}, io.BytesIO(body.encode()))
+        with unittest.mock.patch("urllib.request.urlopen", side_effect=err):
+            try:
+                client.patch_issue("i", {})
+            except WriteRefused as exc:
+                return exc.cap_shaped
+        self.fail("expected WriteRefused")
+
+    def test_cap_code_is_recognised(self):
+        self.assertTrue(self._classify(
+            429, '{"error":"limit","details":{"code":"cross_issue_influence_cap_exceeded"}}'))
+
+    def test_other_429_still_treated_as_cap_shaped(self):
+        """No structured code: fall back to the status, since deferring is the safe default."""
+        self.assertTrue(self._classify(429, '{"error":"slow down"}'))
+
+    def test_ownership_gate_is_not_cap_shaped(self):
+        """A permission wall must burn attempts and park -- retrying it can never help."""
+        self.assertFalse(self._classify(
+            403, '{"error":"forbidden","details":{"code":"issue_mutation_not_allowed"}}'))
+
+    def test_server_error_is_not_cap_shaped(self):
+        self.assertFalse(self._classify(500, "internal error"))
 
 
 class PlanningTests(unittest.TestCase):

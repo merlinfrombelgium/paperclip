@@ -43,11 +43,21 @@ STATE_VERSION = 1
 DOCUMENT_KEY = "board-doctor-worklist"
 DOCUMENT_TITLE = "Board Doctor sweep worklist"
 
-# Conservative defaults. The observed cross-issue influence cap is 20 writes per source
-# issue (hard-enforcing 2026-08-11); RESERVE holds back budget for the closing
-# checkpoint flush and status comment.
+# Verified against the shipped enforcement code (ZIM-2068, 2026-08-07):
+#   * The cap is 20 cross-issue writes **per heartbeat run**, not per source issue. The
+#     count predicate is companyId + runId + action, so budget resets every heartbeat --
+#     which is exactly what makes converge-across-heartbeats work.
+#   * Updates and comments share one counter.
+#   * Writes to your own issue are free and uncounted, so the checkpoint flush and the
+#     closing status comment (both on the source issue) cost nothing.
+# RESERVE is therefore no longer needed to pay for the checkpoint. It is kept as a small
+# margin against miscounting a write we failed to attribute; set it to 0 for full budget.
 DEFAULT_CAP = 20
-DEFAULT_RESERVE = 2
+DEFAULT_RESERVE = 1
+
+# The refusal is clean and catchable: HTTP 429 with this code, returned *before* the
+# mutation, so there is no partial write and no run abort. Branch on the code, not prose.
+CAP_REFUSAL_CODE = "cross_issue_influence_cap_exceeded"
 
 # A single item that keeps failing must not wedge the sweep forever. After this many
 # heartbeats it is parked as failed_permanent and surfaced for board action.
@@ -251,12 +261,13 @@ class PaperclipClient:
                 raw = resp.read().decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode()[:400]
-            # 429 is the documented rate-limit shape; the cap may also surface as a 403
-            # mentioning a limit. Treat both as cap-shaped so the engine parks rather than
-            # burning attempts on a budget problem it cannot retry out of.
-            cap_shaped = exc.code == 429 or (
-                exc.code == 403 and any(w in detail.lower() for w in ("cap", "limit", "quota", "influence"))
-            )
+            # Prefer the structured code over the prose, which is free to change.
+            code = None
+            try:
+                code = (json.loads(detail).get("details") or {}).get("code")
+            except (ValueError, AttributeError):
+                pass
+            cap_shaped = code == CAP_REFUSAL_CODE or (code is None and exc.code == 429)
             raise WriteRefused(f"HTTP {exc.code} {method} {path}: {detail}", cap_shaped) from exc
         except urllib.error.URLError as exc:
             raise WriteRefused(f"network error {method} {path}: {exc.reason}") from exc
@@ -489,17 +500,21 @@ class Sweeper:
             try:
                 self._apply_one(item)
             except WriteRefused as exc:
-                result.writes_used += 1  # assume it counted; the refusal shape is unverified
                 item.last_error = str(exc)
                 dirty = True
                 if exc.cap_shaped:
-                    # Budget problem, not a bad item. Do not burn an attempt on it and do
-                    # not keep hammering the cap -- checkpoint and let the next heartbeat
-                    # pick it up with a fresh allowance.
-                    item.note = "deferred: cap-shaped refusal"
+                    # Budget problem, not a bad item. A rejected attempt does not consume
+                    # budget (it is logged under a separate _cap_rejected action that the
+                    # counter ignores), so do not charge it here -- but the counter is
+                    # already at the cap, so retrying this heartbeat cannot succeed.
+                    # Checkpoint and let the next heartbeat start with a fresh allowance.
+                    item.note = "deferred: cap refusal"
                     result.stopped_for_budget = True
                     result.errors.append(f"{item.target_identifier}: {exc}")
                     break
+                # Any other failure did reach the mutation path; assume it was charged,
+                # since the cap charges before the write and never refunds.
+                result.writes_used += 1
                 item.attempts += 1
                 result.failed += 1
                 result.errors.append(f"{item.target_identifier}: {exc}")
