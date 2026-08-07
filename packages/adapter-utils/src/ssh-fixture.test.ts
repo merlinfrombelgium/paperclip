@@ -144,6 +144,72 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).toBe("hello over ssh stdin\n");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("delivers env over the ssh channel and removes the staged file", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env delivery test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+
+    // Values are staged in a 0600 remote file rather than inlined into ssh
+    // argv (ZIM-2069); this proves the remote command still receives them.
+    const result = await runSshCommand(
+      config,
+      'printf "%s\\n" "$PAPERCLIP_API_KEY"',
+      {
+        env: { PAPERCLIP_API_KEY: "sentinel-value-over-channel" },
+        timeoutMs: 30_000,
+      },
+    );
+
+    expect(result.stdout.trim()).toBe("sentinel-value-over-channel");
+
+    // The remote script deletes the staged file as soon as it sources it.
+    const leftovers = await runSshCommand(
+      config,
+      'ls "${TMPDIR:-/tmp}" | grep -c "^paperclip-env-" || true',
+      { timeoutMs: 30_000 },
+    );
+    expect(leftovers.stdout.trim()).toBe("0");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("lets explicit env override a value re-exported by a remote login profile", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env profile-override test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+
+    // Profiles are sourced before the staged env is loaded, so an explicit
+    // value must win over anything the profile re-exports.
+    const homeDir = (await runSshCommand(config, 'printf "%s" "$HOME"', { timeoutMs: 30_000 })).stdout.trim();
+    const profilePath = path.posix.join(homeDir, ".profile");
+    await runSshCommand(
+      config,
+      `printf 'export PAPERCLIP_PROFILE_MARKER=from-profile\\n' >> ${JSON.stringify(profilePath)}`,
+      { timeoutMs: 30_000 },
+    );
+
+    try {
+      const result = await runSshCommand(
+        config,
+        'printf "%s\\n" "$PAPERCLIP_PROFILE_MARKER"',
+        {
+          env: { PAPERCLIP_PROFILE_MARKER: "from-explicit-env" },
+          timeoutMs: 30_000,
+        },
+      );
+      expect(result.stdout.trim()).toBe("from-explicit-env");
+    } finally {
+      await runSshCommand(config, `rm -f ${JSON.stringify(profilePath)}`, { timeoutMs: 30_000 })
+        .catch(() => undefined);
+    }
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("does not treat an unrelated reused pid as the running fixture", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
     cleanupDirs.push(rootDir);
