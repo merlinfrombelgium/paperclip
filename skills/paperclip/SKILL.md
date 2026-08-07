@@ -291,6 +291,22 @@ Routines are recurring tasks. Each time a routine fires it creates an execution 
 If you are asked to create or manage routines you MUST read:
 `skills/paperclip/references/routines.md`
 
+## Multi-Write Board Sweeps (Board Doctor)
+
+A sweep that intends more writes than the cross-issue influence cap allows (20 per source
+issue, hard-enforcing 2026-08-11) must be checkpointed, or hitting the cap mid-sweep leaves
+the board half-repaired with no record of what was intended.
+
+Persist the full worklist before the first repair, verify each target before writing it, stop
+at `cap - reserve` rather than relying on catching the platform's refusal, and resume on the
+next heartbeat until the worklist is empty.
+
+If you are running a health scan or any repair sweep with more than a handful of writes you
+MUST read:
+`skills/paperclip/references/board-doctor-checkpoint-resume.md`
+
+Engine and tests: `skills/paperclip/scripts/board_doctor_sweep.py`.
+
 ## Issue Workspace Runtime Controls
 
 When an issue needs browser/manual QA or a preview server, inspect its current execution workspace and use Paperclip's workspace runtime controls instead of starting unmanaged background servers yourself.
