@@ -57,6 +57,7 @@ import {
   updateDocumentAnnotationThreadSchema,
   upsertIssueDocumentSchema,
   updateIssueSchema,
+  withdrawIssueThreadInteractionSchema,
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedIsolatedExecutionWorkspace,
   isUuidLike,
@@ -7408,6 +7409,78 @@ export function issueRoutes(
         actor,
         source: "issue.interaction.cancel",
       });
+
+      res.json(interaction);
+    },
+  );
+
+  // Retraction, not resolution: the authoring agent may pull back its own still
+  // pending interaction. Accept/reject/respond/cancel stay board-only, so the
+  // decision on the merits is still the board's to make.
+  router.post(
+    "/issues/:id/interactions/:interactionId/withdraw",
+    validate(withdrawIssueThreadInteractionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await svc.getById(id);
+      if (!issue) {
+        res.status(404).json({ error: "Issue not found" });
+        return;
+      }
+      assertCompanyAccess(req, issue.companyId);
+      if (req.actor.type === "agent") {
+        if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+        if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+      } else {
+        assertBoard(req);
+      }
+
+      const actor = getActorInfo(req);
+      if (actor.actorType === "agent" && !actor.agentId) {
+        res.status(403).json({ error: "Agent actors must be identified to withdraw an interaction" });
+        return;
+      }
+
+      const interaction = await issueThreadInteractionService(db).withdrawInteraction(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+        { requireAuthoringAgentId: req.actor.type === "agent" ? actor.agentId : null },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        action: "issue.thread_interaction_withdrawn",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          withdrawnBy: actor.actorType,
+        },
+      });
+
+      // Only wake the assignee when someone else retracted the card it is waiting
+      // on. An agent withdrawing its own interaction is already awake.
+      if (!(actor.actorType === "agent" && actor.actorId === issue.assigneeAgentId)) {
+        queueResolvedInteractionContinuationWakeup({
+          heartbeat,
+          issue,
+          interaction,
+          actor,
+          source: "issue.interaction.withdraw",
+        });
+      }
 
       res.json(interaction);
     },
