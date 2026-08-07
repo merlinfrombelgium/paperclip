@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
+import {
+  constants as fsConstants,
+  createReadStream,
+  createWriteStream,
+  promises as fs,
+  rmSync,
+} from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -355,18 +361,107 @@ async function resolveCommandPath(command: string): Promise<string | null> {
   }
 }
 
+/**
+ * Directories and agent processes that must not outlive this process.
+ *
+ * Every ssh staging path cleans up in a `finally`, and a `finally` is bypassed
+ * when the run process is killed mid-command. That is not theoretical: during
+ * the ZIM-2090 review a `paperclip-ssh-key-*` directory created at 12:02:45Z
+ * was still holding a complete private key at 12:11:34Z, on a host whose /tmp
+ * retention is 30 days, while sibling directories from runs that exited
+ * normally were gone within a minute. The registry below closes that gap for
+ * every termination Node can observe.
+ *
+ * SIGKILL and a hard crash remain uncoverable from inside the process — which
+ * is one more reason the on-disk key (ZIM-2088) is opt-in only and the default
+ * path keeps the key in agent memory, where a lost process takes the secret
+ * with it.
+ */
+const strandedSshTempDirs = new Set<string>();
+const strandedSshAgentPids = new Set<number>();
+const TERMINATION_SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM"];
+let emergencySshCleanupInstalled = false;
+
+function runEmergencySshCleanup(): void {
+  for (const pid of strandedSshAgentPids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // Already gone, or never ours to signal.
+    }
+  }
+  strandedSshAgentPids.clear();
+  for (const dir of strandedSshTempDirs) {
+    try {
+      // Synchronous on purpose: an `exit` handler cannot await anything.
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Best effort — a failure here must not mask the original exit.
+    }
+  }
+  strandedSshTempDirs.clear();
+}
+
+function handleTerminationSignal(signal: NodeJS.Signals): void {
+  runEmergencySshCleanup();
+  process.removeListener(signal, handleTerminationSignal);
+  // Listening at all suppressed Node's default disposition for this signal, so
+  // put it back: re-raise and let the process die as it would have. If someone
+  // else has since registered a handler, they own the shutdown and re-raising
+  // would cut their graceful path short.
+  if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+}
+
+function installEmergencySshCleanup(): void {
+  if (emergencySshCleanupInstalled) return;
+  emergencySshCleanupInstalled = true;
+  process.on("exit", runEmergencySshCleanup);
+  for (const signal of TERMINATION_SIGNALS) {
+    // An existing listener means something else already owns this signal's
+    // shutdown sequence; `exit` still covers us once it finishes.
+    if (process.listenerCount(signal) > 0) continue;
+    process.on(signal, handleTerminationSignal);
+  }
+}
+
+/** Registers `dir` for emergency removal; returns the deregistration hook. */
+function trackStrandedSshTempDir(dir: string): () => void {
+  strandedSshTempDirs.add(dir);
+  installEmergencySshCleanup();
+  return () => {
+    strandedSshTempDirs.delete(dir);
+  };
+}
+
+/** Registers `pid` for an emergency SIGKILL; returns the deregistration hook. */
+function trackStrandedSshAgentPid(pid: number): () => void {
+  strandedSshAgentPids.add(pid);
+  installEmergencySshCleanup();
+  return () => {
+    strandedSshAgentPids.delete(pid);
+  };
+}
+
 async function withTempFile(
   prefix: string,
   contents: string,
   mode: number,
 ): Promise<{ path: string; cleanup: () => Promise<void> }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+  const untrack = trackStrandedSshTempDir(dir);
   const filePath = path.join(dir, "payload");
   const normalizedContents = contents.endsWith("\n") ? contents : `${contents}\n`;
-  await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8" });
+  try {
+    await fs.writeFile(filePath, normalizedContents, { mode, encoding: "utf8" });
+  } catch (error) {
+    untrack();
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+    throw error;
+  }
   return {
     path: filePath,
     cleanup: async () => {
+      untrack();
       await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
     },
   };
@@ -448,7 +543,9 @@ async function startSshIdentityAgent(privateKey: string): Promise<SshIdentityAge
   // long here, so keep the socket's leaf name to a single character.
   const socketPath = path.join(dir, "s");
 
+  const untrackDir = trackStrandedSshTempDir(dir);
   const removeDir = async () => {
+    untrackDir();
     await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
   };
 
@@ -466,7 +563,11 @@ async function startSshIdentityAgent(privateKey: string): Promise<SshIdentityAge
   }
 
   const agentPid = parseSshAgentPid(startOutput.stdout);
+  // The agent holds the key in its own memory, so an agent that outlives this
+  // process outlives the only thing bounding its exposure to the shared uid.
+  const untrackPid = agentPid == null ? () => {} : trackStrandedSshAgentPid(agentPid);
   const killAgent = async () => {
+    untrackPid();
     if (agentPid == null) {
       // Unreachable with stock OpenSSH. If it ever happens we cannot reap the
       // process, but the identity is memory-only and self-expires, so degrade
@@ -542,7 +643,9 @@ async function createSshKeyAuthArgs(
     console.warn(
       `[ssh] ${ON_DISK_KEY_ESCAPE_HATCH_ENV}=1: writing the SSH private key to a temp file. ` +
         "Every agent on this host shares one uid, so 0600 is not a boundary and the key is readable by " +
-        "any of them for as long as the connection lives (ZIM-2088). Unset this to use ssh-agent.",
+        "any of them for as long as the connection lives (ZIM-2088). The file is removed on exit and on " +
+        "SIGHUP/SIGINT/SIGTERM, but a SIGKILL or a crash strands it on disk until /tmp is reaped. " +
+        "Unset this to use ssh-agent.",
     );
     const keyFile = await withTempFile("paperclip-ssh-key-", privateKey, 0o600);
     return { args: ["-i", keyFile.path], cleanup: keyFile.cleanup };
