@@ -1579,6 +1579,14 @@ export async function syncDirectoryToSsh(input: {
   progressLabel?: string;
 }): Promise<void> {
   const auth = await createSshAuthArgs(input.spec);
+  // Name the workspace's top-level entries explicitly rather than archiving
+  // ".": a "." archive carries a "./" member whose mode the extracting tar
+  // restores onto the remote workspace directory, silently re-stamping it with
+  // the local workspace's mode — the outbound half of ZIM-2091. Matches
+  // createTarballFromDirectory in sandbox-managed-runtime.ts and stays portable
+  // across GNU/BSD/busybox tar.
+  const topLevelEntries = (await fs.readdir(input.localDir)).sort((left, right) =>
+    left.localeCompare(right));
   const sshArgs = [
     ...auth.args,
     "-p",
@@ -1615,7 +1623,10 @@ export async function syncDirectoryToSsh(input: {
       ...tarExcludeArgs(input.exclude),
       "-cf",
       "-",
-      ".",
+      // A blank workspace has no entries to name, and tar refuses to create an
+      // archive from an empty operand list; an empty file list produces the
+      // valid empty archive the remote side then extracts as a no-op.
+      ...(topLevelEntries.length > 0 ? ["--", ...topLevelEntries] : ["-T", "/dev/null"]),
     ];
     const tar = spawn("tar", tarArgs, {
       stdio: ["ignore", "pipe", "pipe"],

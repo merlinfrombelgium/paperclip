@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -291,6 +291,52 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).not.toContain("appledouble-present");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("leaves the remote workspace directory's own mode alone when syncing into it", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-overlay");
+    const emptyLocalDir = path.join(rootDir, "blank-workspace");
+
+    await mkdir(localDir, { recursive: true });
+    await mkdir(emptyLocalDir, { recursive: true });
+    await mkdir(path.join(localDir, "nested"), { recursive: true });
+    await writeFile(path.join(localDir, "message.txt"), "hello from paperclip\n", "utf8");
+    await writeFile(path.join(localDir, "nested", "inner.txt"), "nested\n", "utf8");
+    await writeFile(path.join(localDir, ".hidden"), "dotfile\n", "utf8");
+    // The local workspace is world-readable, as a checkout normally is.
+    await chmod(localDir, 0o755);
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH remote workspace mode test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const remoteDir = path.posix.join(started.workspaceDir, "hardened-overlay");
+
+    // A remote workspace an operator has deliberately made private. Archiving
+    // "." would hand tar a "./" member carrying the local 0755 and reopen it.
+    await runSshCommand(config, `mkdir -p ${remoteDir} && chmod 700 ${remoteDir}`);
+
+    await syncDirectoryToSsh({ spec, localDir, remoteDir });
+
+    expect((await runSshCommand(config, `stat -c %a ${remoteDir}`)).stdout.trim()).toBe("700");
+    // Hidden and nested entries still cross with the top-level entries named
+    // explicitly, and the sync is still a full-fidelity copy.
+    const synced = await runSshCommand(
+      config,
+      `cat ${path.posix.join(remoteDir, "message.txt")} ${path.posix.join(remoteDir, ".hidden")} ${path.posix.join(remoteDir, "nested", "inner.txt")}`,
+    );
+    expect(synced.stdout).toContain("hello from paperclip");
+    expect(synced.stdout).toContain("dotfile");
+    expect(synced.stdout).toContain("nested");
+
+    // A blank workspace has no top-level entries to name; the sync must stay a
+    // clean no-op rather than failing to build an archive.
+    const emptyRemoteDir = path.posix.join(started.workspaceDir, "blank-overlay");
+    await syncDirectoryToSsh({ spec, localDir: emptyLocalDir, remoteDir: emptyRemoteDir });
+    expect((await runSshCommand(config, `ls -A ${emptyRemoteDir} | wc -l`)).stdout.trim()).toBe("0");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("reports throttled upload progress with a clamped percent and terminal 100% line", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
     cleanupDirs.push(rootDir);
@@ -380,6 +426,101 @@ describe("ssh env-lab fixture", () => {
     const last = lines.at(-1)!;
     expect(last.percent === 100 || (last.percent === null && last.doneMb !== null)).toBe(true);
     // The restored files round-tripped through the byte-counting transport.
+    await expect(readFile(path.join(restoreDir, "blob-0.bin"))).resolves.toEqual(
+      Buffer.alloc(256 * 1024, 1),
+    );
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
+  it("keeps the restore staging directory private while extracting a 0755 remote workspace", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
+    cleanupDirs.push(rootDir);
+    const statePath = path.join(rootDir, "state.json");
+    const localDir = path.join(rootDir, "local-overlay");
+    const restoreDir = path.join(rootDir, "restore-target");
+    // A test-private TMPDIR so the sampler below can only ever see this test's
+    // staging directories, never a concurrent restore's on a shared /tmp. Kept
+    // directly under the real tmpdir with a short prefix: the restore stages an
+    // ssh-agent socket under TMPDIR too, and that path has to stay inside the
+    // ~108 byte Unix domain socket limit.
+    const privateTmpDir = await mkdtemp(path.join(os.tmpdir(), "pc-tmp-"));
+    cleanupDirs.push(privateTmpDir);
+
+    await mkdir(localDir, { recursive: true });
+    await mkdir(restoreDir, { recursive: true });
+    for (let index = 0; index < 8; index += 1) {
+      await writeFile(path.join(localDir, `blob-${index}.bin`), Buffer.alloc(256 * 1024, index + 1));
+    }
+    // tar only stamps the "./" member's mode onto the extraction target once it
+    // is done, so the exposure starts when extraction ends and lasts until the
+    // staging tree is removed. Enough entries that the copy-out phase in
+    // between spans many sampler ticks instead of finishing inside one.
+    await mkdir(path.join(localDir, "many"), { recursive: true });
+    await Promise.all(
+      Array.from({ length: 1_500 }, (_unused, index) =>
+        writeFile(path.join(localDir, "many", `file-${index}.txt`), `entry ${index}\n`)),
+    );
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH restore staging permission test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+    const remoteDir = path.posix.join(started.workspaceDir, "restore-source");
+
+    await syncDirectoryToSsh({ spec, localDir, remoteDir });
+    // The finding needs a group/world-readable remote workspace directory: its
+    // mode is what the archive's "./" member carries onto the local extraction
+    // target, widening the 0700 staging directory to 0755 mid-restore.
+    await runSshCommand(config, `chmod 755 ${remoteDir}`);
+    expect((await runSshCommand(config, `stat -c %a ${remoteDir}`)).stdout.trim()).toBe("755");
+
+    // Sample the staging tree for the whole restore, so a mode that only
+    // widens once tar has written the "./" member is caught after extraction
+    // rather than only at mkdtemp time.
+    const rootModes: Array<{ path: string; mode: string }> = [];
+    const lastInnerMode = new Map<string, string>();
+    let sampling = true;
+    const sampler = (async () => {
+      while (sampling) {
+        for (const entry of await readdir(privateTmpDir).catch(() => [] as string[])) {
+          if (!entry.startsWith("paperclip-ssh-sync-back-")) continue;
+          const stagingRoot = path.join(privateTmpDir, entry);
+          const rootStats = await stat(stagingRoot).catch(() => null);
+          if (!rootStats?.isDirectory()) continue;
+          rootModes.push({ path: stagingRoot, mode: (rootStats.mode & 0o777).toString(8) });
+          for (const child of await readdir(stagingRoot).catch(() => [] as string[])) {
+            const childPath = path.join(stagingRoot, child);
+            const childStats = await stat(childPath).catch(() => null);
+            if (!childStats?.isDirectory()) continue;
+            lastInnerMode.set(childPath, (childStats.mode & 0o777).toString(8));
+          }
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+    })();
+
+    const previousTmpDir = process.env.TMPDIR;
+    process.env.TMPDIR = privateTmpDir;
+    try {
+      await syncDirectoryFromSsh({ spec, remoteDir, localDir: restoreDir });
+    } finally {
+      sampling = false;
+      await sampler;
+      if (previousTmpDir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previousTmpDir;
+    }
+
+    // Guards against a vacuous pass: the sampler must actually have observed
+    // the staging tree, not just an empty TMPDIR.
+    expect(rootModes.length).toBeGreaterThan(0);
+    expect(lastInnerMode.size).toBeGreaterThan(0);
+    // The security boundary. tar can still restamp the directory it extracts
+    // into, but that directory now lives one level down, and the root it lives
+    // under is never traversable by another uid at any point in the restore.
+    expect(rootModes.filter((sample) => sample.mode !== "700")).toEqual([]);
+    // The directory tar extracted into is re-tightened once extraction ends,
+    // so by the time the workspace is copied out it is private again too.
+    expect([...lastInnerMode.values()]).toEqual([...lastInnerMode.keys()].map(() => "700"));
+    // ...and the restore still produced the workspace it was supposed to.
     await expect(readFile(path.join(restoreDir, "blob-0.bin"))).resolves.toEqual(
       Buffer.alloc(256 * 1024, 1),
     );
