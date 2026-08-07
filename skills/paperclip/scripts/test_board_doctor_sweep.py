@@ -297,6 +297,32 @@ class IdempotencyTests(unittest.TestCase):
         self.assertEqual(result.skipped, 1)
         self.assertNotIn(("issue-2", "patch"), board.write_log)
 
+    def test_write_that_landed_but_lost_its_response_is_not_repeated(self):
+        """Budget is charged before the write and never refunded, so a lost response means
+        the repair may well have landed. Record it as attempted, never as confirmed, and let
+        verification settle it on the next heartbeat."""
+        board = make_board(3, cap=100)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", make_items(3), cap=100, reserve=1)
+
+        real_patch = board.patch_issue
+
+        def patch_then_lose_the_response(issue_id, patch):
+            real_patch(issue_id, patch)  # server-side effect happens...
+            raise WriteRefused("network error: connection reset")  # ...client never hears
+
+        board.patch_issue = patch_then_lose_the_response
+        _, first = sweeper.run()
+        self.assertEqual(first.applied, 0, "a lost response must not be recorded as done")
+
+        board.patch_issue = real_patch
+        writes_before = len(board.write_log)
+        _, second = sweeper.run()
+
+        self.assertEqual(len(board.write_log), writes_before, "re-wrote an already-landed repair")
+        self.assertEqual(second.skipped, 3)
+        self.assertTrue(second.complete)
+
     def test_replanning_the_same_condition_yields_stable_keys(self):
         self.assertEqual([i.key for i in make_items(3)], [i.key for i in make_items(3)])
 
