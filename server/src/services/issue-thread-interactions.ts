@@ -18,6 +18,7 @@ import type {
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   IssueThreadInteraction,
+  IssueThreadInteractionResult,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
   RequestConfirmationTarget,
@@ -25,6 +26,7 @@ import type {
   RespondIssueThreadInteraction,
   SuggestTasksInteraction,
   SuggestTasksResultCreatedTask,
+  WithdrawIssueThreadInteraction,
 } from "@paperclipai/shared";
 import {
   acceptIssueThreadInteractionSchema,
@@ -39,8 +41,9 @@ import {
   requestConfirmationResultSchema,
   suggestTasksPayloadSchema,
   suggestTasksResultSchema,
+  withdrawIssueThreadInteractionSchema,
 } from "@paperclipai/shared";
-import { conflict, notFound, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { issueService, runWorkspaceIsFinalized } from "./issues.js";
 
@@ -248,6 +251,37 @@ function buildSupersededByCommentResult(row: IssueThreadInteractionRow, commentI
     outcome: "superseded_by_comment",
     commentId,
   } as const;
+}
+
+function buildWithdrawnResult(
+  row: IssueThreadInteractionRow,
+  reason: string | null,
+): IssueThreadInteractionResult {
+  if (row.kind === "ask_user_questions") {
+    return {
+      version: 1,
+      answers: [],
+      cancelled: true,
+      cancellationReason: reason,
+      summaryMarkdown: null,
+    };
+  }
+
+  if (row.kind === "suggest_tasks") {
+    return {
+      version: 1,
+      createdTasks: [],
+      skippedClientKeys: [],
+      cancelled: true,
+      cancellationReason: reason,
+    };
+  }
+
+  return {
+    version: 1,
+    outcome: "withdrawn",
+    reason,
+  };
 }
 
 function resolveActorKind(interaction: Pick<IssueThreadInteraction, "resolvedByAgentId" | "resolvedByUserId">) {
@@ -1688,6 +1722,67 @@ export function issueThreadInteractionService(db: Db) {
       const cancelled = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;
+    },
+
+    /**
+     * Retract a still-pending interaction without resolving the decision it asked
+     * for. Unlike accept/reject/respond/cancel this is reachable by the agent that
+     * authored the interaction, so an agent roster can clear its own stale
+     * board-only cards instead of leaving them for manual board cleanup.
+     */
+    withdrawInteraction: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      input: WithdrawIssueThreadInteraction,
+      actor: InteractionActor,
+      opts: { requireAuthoringAgentId?: string | null } = {},
+    ) => {
+      const data = withdrawIssueThreadInteractionSchema.parse(input);
+      const current = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!current) throw notFound("Interaction not found");
+      if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
+        throw notFound("Interaction not found");
+      }
+
+      const requiredAuthoringAgentId = opts.requireAuthoringAgentId ?? null;
+      if (requiredAuthoringAgentId && current.createdByAgentId !== requiredAuthoringAgentId) {
+        throw forbidden("Only the authoring agent can withdraw this interaction");
+      }
+
+      if (current.status !== "pending") {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      const reason = data.reason?.trim() || null;
+      const [updated] = await db
+        .update(issueThreadInteractions)
+        .set({
+          status: "cancelled",
+          result: buildWithdrawnResult(current, reason),
+          resolvedByAgentId: actor.agentId ?? null,
+          resolvedByUserId: actor.userId ?? null,
+          resolvedAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          eq(issueThreadInteractions.status, "pending"),
+        ))
+        .returning();
+
+      if (!updated) {
+        throw conflict("Interaction has already been resolved");
+      }
+
+      await touchIssue(db, issue.id);
+      const withdrawn = hydrateInteraction(updated);
+      await emitInteractionResolvedTelemetry(db, withdrawn);
+      return withdrawn;
     },
   };
 }

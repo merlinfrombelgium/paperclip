@@ -1031,6 +1031,132 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  it("lets the authoring agent withdraw its own pending board-only interaction", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Checkbox confirmation withdraw");
+    const authoringAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+
+    await db.insert(agents).values([
+      {
+        id: authoringAgentId,
+        companyId,
+        name: "ZiMi",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Builder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_checkbox_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Patch locally, report upstream, or both?",
+        options: [
+          { id: "local", label: "Patch locally" },
+          { id: "upstream", label: "Report upstream" },
+        ],
+      },
+    }, {
+      agentId: authoringAgentId,
+    });
+
+    await expect(interactionsSvc.withdrawInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {}, {
+      agentId: otherAgentId,
+    }, {
+      requireAuthoringAgentId: otherAgentId,
+    })).rejects.toThrow("Only the authoring agent can withdraw this interaction");
+
+    const withdrawn = await interactionsSvc.withdrawInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {
+      reason: "Routing settled elsewhere",
+    }, {
+      agentId: authoringAgentId,
+    }, {
+      requireAuthoringAgentId: authoringAgentId,
+    });
+
+    expect(withdrawn).toMatchObject({
+      kind: "request_checkbox_confirmation",
+      status: "cancelled",
+      result: {
+        version: 1,
+        outcome: "withdrawn",
+        reason: "Routing settled elsewhere",
+      },
+      resolvedByAgentId: authoringAgentId,
+      resolvedByUserId: null,
+    });
+
+    await expect(interactionsSvc.withdrawInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {}, {
+      agentId: authoringAgentId,
+    }, {
+      requireAuthoringAgentId: authoringAgentId,
+    })).rejects.toThrow("Interaction has already been resolved");
+  });
+
+  it("withdraws board-authored suggest_tasks without an authoring-agent requirement", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Suggest tasks withdraw");
+
+    const created = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "suggest_tasks",
+      payload: {
+        version: 1,
+        tasks: [{ clientKey: "task-1", title: "One" }],
+      },
+    }, {
+      userId: "local-board",
+    });
+
+    const withdrawn = await interactionsSvc.withdrawInteraction({
+      id: issueId,
+      companyId,
+    }, created.id, {}, {
+      userId: "local-board",
+    });
+
+    expect(withdrawn).toMatchObject({
+      kind: "suggest_tasks",
+      status: "cancelled",
+      result: {
+        version: 1,
+        createdTasks: [],
+        skippedClientKeys: [],
+        cancelled: true,
+        cancellationReason: null,
+      },
+      resolvedByUserId: "local-board",
+    });
+  });
+
   it("enforces request_checkbox_confirmation selected option references and bounds", async () => {
     const { companyId, goalId, issueId } = await seedConfirmationIssue("Checkbox confirmation bounds");
 

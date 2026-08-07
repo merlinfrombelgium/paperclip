@@ -19,6 +19,7 @@ const mockInteractionService = vi.hoisted(() => ({
   expireRequestConfirmationsSupersededByHistoricalComments: vi.fn(),
   answerQuestions: vi.fn(),
   cancelQuestions: vi.fn(),
+  withdrawInteraction: vi.fn(),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -498,6 +499,136 @@ describe.sequential("issue thread interaction routes", () => {
       expect.anything(),
       expect.objectContaining({
         action: "issue.thread_interaction_cancelled",
+      }),
+    );
+  });
+
+  it("still refuses agent actors on the board-only cancel route", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/cancel")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.cancelQuestions).not.toHaveBeenCalled();
+  });
+
+  it("lets an agent withdraw its own interaction without waking itself", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      createIssue({ assigneeAgentId: CREATED_AGENT_ID, status: "in_review" }),
+    );
+    mockInteractionService.withdrawInteraction.mockResolvedValue({
+      id: "interaction-6",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "request_checkbox_confirmation",
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: "run-1",
+      payload: {
+        version: 1,
+        prompt: "Patch locally or upstream?",
+        options: [{ id: "local", label: "Patch locally" }],
+      },
+      result: { version: 1, outcome: "withdrawn", reason: "Resolved elsewhere" },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: CREATED_AGENT_ID,
+      companyId: "company-1",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-6/withdraw")
+      .send({ reason: "Resolved elsewhere" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-6",
+      { reason: "Resolved elsewhere" },
+      { agentId: CREATED_AGENT_ID, userId: null },
+      { requireAuthoringAgentId: CREATED_AGENT_ID },
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.thread_interaction_withdrawn",
+        details: expect.objectContaining({
+          interactionId: "interaction-6",
+          withdrawnBy: "agent",
+        }),
+      }),
+    );
+  });
+
+  it("wakes the assignee when a board user withdraws the interaction it is waiting on", async () => {
+    mockInteractionService.withdrawInteraction.mockResolvedValue({
+      id: "interaction-6",
+      companyId: "company-1",
+      issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      kind: "ask_user_questions",
+      status: "cancelled",
+      continuationPolicy: "wake_assignee",
+      idempotencyKey: null,
+      sourceCommentId: "comment-2",
+      sourceRunId: "run-2",
+      payload: {
+        version: 1,
+        questions: [{
+          id: "scope",
+          prompt: "Scope?",
+          selectionMode: "single",
+          options: [{ id: "phase-1", label: "Phase 1" }],
+        }],
+      },
+      result: {
+        version: 1,
+        answers: [],
+        cancelled: true,
+        cancellationReason: null,
+        summaryMarkdown: null,
+      },
+      createdAt: "2026-04-20T12:00:00.000Z",
+      updatedAt: "2026-04-20T12:05:00.000Z",
+      resolvedAt: "2026-04-20T12:05:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-6/withdraw")
+      .send({});
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-6",
+      {},
+      expect.objectContaining({ userId: "local-board" }),
+      { requireAuthoringAgentId: null },
+    );
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({
+          interactionId: "interaction-6",
+          interactionStatus: "cancelled",
+        }),
       }),
     );
   });

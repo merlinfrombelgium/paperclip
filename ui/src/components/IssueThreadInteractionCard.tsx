@@ -565,6 +565,18 @@ function SuggestTasksCard({
         </div>
       ) : null}
 
+      {interaction.status === "cancelled" ? (
+        <div className="rounded-sm border border-border/70 bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
+          <div className="text-[11px] font-semibold uppercase tracking-[0.16em]">
+            Withdrawn
+          </div>
+          <p className="mt-1 leading-6">
+            {interaction.result?.cancellationReason
+              || "The agent that suggested these tasks withdrew the request. No issues were created."}
+          </p>
+        </div>
+      ) : null}
+
       {interaction.status === "pending" ? (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1142,6 +1154,19 @@ function RequestConfirmationResolution({
     );
   }
 
+  if (interaction.status === "cancelled") {
+    return (
+      <div className="space-y-2 rounded-sm border border-border/70 bg-muted/40 px-4 py-3 text-sm text-muted-foreground">
+        <div className="text-[11px] font-semibold uppercase tracking-[0.16em]">Withdrawn</div>
+        <p className="leading-6">
+          {interaction.result?.reason
+            || "The agent that raised this request withdrew it before it was resolved."}
+        </p>
+        <RequestConfirmationTargetChip interaction={interaction} target={target} tone="subtle" />
+      </div>
+    );
+  }
+
   if (interaction.status === "expired") {
     const expiredByComment = outcome === "superseded_by_comment";
     const expiredByTargetChange = outcome === "stale_target";
@@ -1537,7 +1562,7 @@ function RequestCheckboxConfirmationResolution({
     return <RequestConfirmationResolution interaction={interaction as unknown as RequestConfirmationInteraction} />;
   }
 
-  if (interaction.status === "expired") {
+  if (interaction.status === "cancelled" || interaction.status === "expired") {
     return <RequestConfirmationResolution interaction={interaction as unknown as RequestConfirmationInteraction} />;
   }
 
