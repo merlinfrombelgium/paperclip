@@ -46,6 +46,13 @@ jobs:
             echo "COMMITPERCLIP_KEY is not configured; running the gates under the built-in Actions token."
             TOKEN="$FALLBACK_TOKEN"
           fi
+          # An empty token does not fail here on its own — the gates would run
+          # unauthenticated, 401, and surface as "quality gates failed", which
+          # reports a review verdict for what is really a credential problem.
+          if [ -z "$TOKEN" ]; then
+            echo "::error::No token available for the PR gates: neither COMMITPERCLIP_KEY nor the built-in Actions token resolved."
+            exit 1
+          fi
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
         env:
