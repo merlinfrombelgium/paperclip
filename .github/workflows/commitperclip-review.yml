@@ -34,14 +34,23 @@ jobs:
         with:
           node-version: '20'
 
+      # Forks do not hold the commitperclip app key, and the gates only need a
+      # bearer for the PR read/comment calls. Fall back to the built-in Actions
+      # token there rather than failing the whole review before any code is read.
       - name: Generate commitperclip token
         id: token
         run: |
-          TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          if [ -n "$COMMITPERCLIP_KEY" ]; then
+            TOKEN=$(node .github/scripts/get-bot-token.mjs)
+          else
+            echo "COMMITPERCLIP_KEY is not configured; running the gates under the built-in Actions token."
+            TOKEN="$FALLBACK_TOKEN"
+          fi
           echo "::add-mask::$TOKEN"
           echo "value=$TOKEN" >> $GITHUB_OUTPUT
         env:
           COMMITPERCLIP_KEY: ${{ secrets.COMMITPERCLIP_KEY }}
+          FALLBACK_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run quality gates
         id: quality
