@@ -21,6 +21,25 @@ const COMMAND_ENV_SECRET_ASSIGNMENT_RE = new RegExp(
   String.raw`(\b${SECRET_NAME_PATTERN}\s*=\s*)(${QUOTE_WRAPPER_PATTERN})(${SECRET_VALUE_PATTERN})`,
   "gi",
 );
+// Every rule above anchors on a separator (`=`, `--opt`, `Bearer`). Reporters
+// that print a secret as prose do not use one: our own `paperclip env` emits
+// `NAME set [environment] Set in process environment => 'value'`, where the name
+// and the value are ~45 characters and an arrow apart. Anchor on proximity to a
+// secret-named token instead of on the operator, so the whole class is covered
+// rather than one separator at a time. The value has to open with a quote or a
+// bracket, sit within a bounded same-line window, and look high-entropy; paths
+// and URLs near a secret name are excluded so diagnostics stay readable.
+const SECRET_PROXIMITY_WINDOW = 160;
+const SECRET_PROXIMITY_VALUE_CHAR = String.raw`[A-Za-z0-9+/=_.\-]`;
+const COMMAND_SECRET_PROXIMITY_RE = new RegExp(
+  String.raw`(\b${SECRET_NAME_PATTERN}\b[^\r\n"'` +
+    "`" +
+    String.raw`]{0,${SECRET_PROXIMITY_WINDOW}}?["'\[])` +
+    String.raw`(?![~./])(?![A-Za-z][A-Za-z0-9+.\-]*://)` +
+    String.raw`(?=${SECRET_PROXIMITY_VALUE_CHAR}*[0-9+/=])` +
+    String.raw`(${SECRET_PROXIMITY_VALUE_CHAR}{16,})`,
+  "gi",
+);
 const COMMAND_AUTHORIZATION_BEARER_RE = /(\bAuthorization\s*:\s*Bearer\s+)[^\s"'`]+/gi;
 const COMMAND_OPENAI_KEY_RE = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
 const COMMAND_GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g;
@@ -47,6 +66,17 @@ const COMMAND_SECRET_HINTS = [
   "ghr_",
 ] as const;
 
+const SECRET_ENV_VAR_NAME_RE = new RegExp(String.raw`^${SECRET_NAME_PATTERN}$`, "i");
+
+/**
+ * True when an environment variable name is secret-shaped. Reporters that print
+ * env inventories use this to mask the value at the source instead of relying on
+ * the downstream redactor, which is defence in depth rather than the control.
+ */
+export function isSecretEnvVarName(name: string): boolean {
+  return SECRET_ENV_VAR_NAME_RE.test(name);
+}
+
 function maybeContainsSecretText(command: string) {
   const lower = command.toLowerCase();
   return COMMAND_SECRET_HINTS.some((hint) => lower.includes(hint)) || command.includes(".");
@@ -58,6 +88,7 @@ export function redactCommandText(command: string, redactedValue = REDACTED_COMM
     .replace(COMMAND_AUTHORIZATION_BEARER_RE, `$1${redactedValue}`)
     .replace(COMMAND_CLI_SECRET_OPTION_RE, `$1$2${redactedValue}`)
     .replace(COMMAND_ENV_SECRET_ASSIGNMENT_RE, `$1$2${redactedValue}`)
+    .replace(COMMAND_SECRET_PROXIMITY_RE, `$1${redactedValue}`)
     .replace(COMMAND_OPENAI_KEY_RE, redactedValue)
     .replace(COMMAND_GITHUB_TOKEN_RE, redactedValue)
     .replace(COMMAND_JWT_RE, redactedValue);

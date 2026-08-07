@@ -58,6 +58,7 @@ export {
 } from "./log-redaction.js";
 export {
   REDACTED_COMMAND_TEXT_VALUE,
+  isSecretEnvVarName,
   redactCommandText,
 } from "./command-redaction.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
