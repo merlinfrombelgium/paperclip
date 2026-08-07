@@ -52,23 +52,25 @@ export function createSshCommandManagedRuntimeRunner(input: {
       const command = commandInput.command.trim();
       const args = commandInput.args ?? [];
       const cwd = commandInput.cwd?.trim() || defaultCwd;
-      const envEntries = Object.entries(commandInput.env ?? {})
-        .filter((entry): entry is [string, string] => typeof entry[1] === "string");
-      const envPrefix = envEntries.length > 0
-        ? `env ${envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`).join(" ")} `
-        : "";
-      const exportPrefix = envEntries.length > 0
-        ? envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)};`).join(" ") + " "
-        : "";
+      const env = Object.fromEntries(
+        Object.entries(commandInput.env ?? {})
+          .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      );
+      // Env is handed to runSshCommand rather than inlined here: baking
+      // `env KEY=VAL` / `export KEY=VAL` into the remote command string puts
+      // the values in the local ssh process's argv, where any agent sharing
+      // this host's uid can read them out of /proc (ZIM-2069). runSshCommand
+      // owns the single hardened delivery path.
       const commandScript = command === "sh" || command === "bash"
         ? (args[0] === "-c" || args[0] === "-lc") && typeof args[1] === "string"
-          ? `${exportPrefix}${args[1]}`
-          : `${envPrefix}exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`
-        : `${envPrefix}exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`;
+          ? args[1]
+          : `exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`
+        : `exec ${[shellQuote(command), ...args.map((arg) => shellQuote(arg))].join(" ")}`;
       const remoteCommand = `cd ${shellQuote(cwd)} && ${commandScript}`;
 
       try {
         const result = await runSshCommand(input.spec, remoteCommand, {
+          env,
           stdin: commandInput.stdin,
           timeoutMs: commandInput.timeoutMs,
           maxBuffer: maxBufferBytes,
@@ -399,6 +401,82 @@ async function createSshAuthArgs(
     args: sshArgs,
     cleanup: async () => {
       await Promise.all(tempFiles.map((cleanup) => cleanup()));
+    },
+  };
+}
+
+export interface RemoteEnvFile {
+  /** Absolute path of the staged file on the remote host. Safe to put in argv. */
+  path: string;
+  /** Shell fragment that loads the env then deletes the file. Contains no values. */
+  sourceScript: string;
+  /** Best-effort removal for the case where the consuming command never ran. */
+  remove: () => Promise<void>;
+}
+
+/**
+ * Stages `envEntries` in a 0600 file on the remote host and returns only the
+ * path plus a shell fragment that sources it.
+ *
+ * Env values must never reach the local `ssh` argv. `/proc/<pid>/cmdline` is
+ * world readable and every agent on a Paperclip host runs under the same shared
+ * uid, so an inlined `env KEY=VAL` / `export KEY=VAL` leaks one agent's
+ * PAPERCLIP_API_KEY to any other concurrently running agent via a single `ps`
+ * call — cross-agent impersonation with audit attribution to the victim
+ * (ZIM-2069). The values here travel over the encrypted ssh channel on stdin
+ * instead; argv carries the non-secret path only.
+ *
+ * `SendEnv`/`AcceptEnv` is deliberately not used: it requires matching remote
+ * `sshd_config`, which we do not control on arbitrary targets.
+ */
+async function writeRemoteEnvFile(input: {
+  config: SshConnectionConfig;
+  authArgs: string[];
+  envEntries: Array<[string, string]>;
+  timeoutMs?: number;
+}): Promise<RemoteEnvFile> {
+  const fileName = `paperclip-env-${randomUUID()}`;
+  const target = `${input.config.username}@${input.config.host}`;
+  const portArgs = ["-p", String(input.config.port)];
+
+  // `umask 077` before the redirect so the file is never briefly world readable.
+  // The remote shell resolves TMPDIR and echoes back the path it actually used,
+  // so the consuming connection does not have to re-derive it.
+  const writerScript = [
+    "umask 077",
+    'dir="${TMPDIR:-/tmp}"',
+    `file="$dir/${fileName}"`,
+    'cat > "$file"',
+    'chmod 600 "$file"',
+    'printf %s "$file"',
+  ].join(" && ");
+
+  const payload = `${input.envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n")}\n`;
+  const written = await spawnText(
+    "ssh",
+    [...input.authArgs, ...portArgs, target, `sh -c ${shellQuote(writerScript)}`],
+    {
+      stdin: payload,
+      timeout: input.timeoutMs ?? 15_000,
+      maxBuffer: 64 * 1024,
+    },
+  );
+
+  const remotePath = written.stdout.trim();
+  if (!remotePath.startsWith("/") || !remotePath.endsWith(fileName)) {
+    throw new Error("Failed to stage the SSH environment file on the remote host.");
+  }
+
+  const quotedPath = shellQuote(remotePath);
+  return {
+    path: remotePath,
+    sourceScript: `. ${quotedPath} && rm -f ${quotedPath}`,
+    remove: async () => {
+      await execFileText(
+        "ssh",
+        [...input.authArgs, ...portArgs, target, `sh -c ${shellQuote(`rm -f ${quotedPath}`)}`],
+        { timeout: 10_000, maxBuffer: 8 * 1024 },
+      ).catch(() => undefined);
     },
   };
 }
@@ -1166,18 +1244,28 @@ export async function runSshCommand(
       }
     }
 
-    // Mirror buildSshSpawnTarget: source login profiles first, then run
-    // `env KEY=VAL cmd` so user-supplied identity overrides win over anything
-    // a profile re-exports. Without this, a remote profile that resets HOME
+    // Env values are staged in a 0600 remote file rather than inlined into the
+    // remote script, so no value reaches this process's argv (ZIM-2069). This
+    // costs one extra ssh connection, but only when env is actually passed.
+    const envFile = envEntries.length > 0
+      ? await writeRemoteEnvFile({
+          config,
+          authArgs: auth.args,
+          envEntries,
+          timeoutMs: options.timeoutMs,
+        })
+      : null;
+
+    // Mirror buildSshSpawnTarget: source login profiles first, then load the
+    // staged env so user-supplied identity overrides win over anything a
+    // profile re-exports. Without this, a remote profile that resets HOME
     // / NVM_DIR / etc. would silently undo the explicit env passed in here.
-    const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
     const remoteScript = [
       'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-      envArgs.length > 0
-        ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-        : `exec sh -c ${shellQuote(remoteCommand)}`,
+      ...(envFile ? [envFile.sourceScript] : []),
+      `exec sh -c ${shellQuote(remoteCommand)}`,
     ].join(" && ");
 
     sshArgs.push(
@@ -1187,16 +1275,23 @@ export async function runSshCommand(
       `sh -c ${shellQuote(remoteScript)}`,
     );
 
-    return options.stdin != null
-      ? await spawnText("ssh", sshArgs, {
-          stdin: options.stdin,
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        })
-      : await execFileText("ssh", sshArgs, {
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        });
+    try {
+      return options.stdin != null
+        ? await spawnText("ssh", sshArgs, {
+            stdin: options.stdin,
+            timeout: options.timeoutMs ?? 15_000,
+            maxBuffer: options.maxBuffer ?? 1024 * 128,
+          })
+        : await execFileText("ssh", sshArgs, {
+            timeout: options.timeoutMs ?? 15_000,
+            maxBuffer: options.maxBuffer ?? 1024 * 128,
+          });
+    } catch (error) {
+      // The remote script deletes the env file as soon as it sources it, so a
+      // leftover only exists when the command never got that far.
+      await envFile?.remove();
+      throw error;
+    }
   } finally {
     await cleanup();
   }
@@ -1219,9 +1314,16 @@ export async function buildSshSpawnTarget(input: {
   }
   const auth = await createSshAuthArgs(input.spec);
   const sshArgs = [...auth.args];
-  const envArgs = Object.entries(input.env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  const envEntries = Object.entries(input.env)
+    .filter((entry): entry is [string, string] => typeof entry[1] === "string");
+
+  // This target is a long-lived process whose stdin carries the agent protocol
+  // stream, so env cannot be fed over stdin here. Stage it in a 0600 remote
+  // file instead — the values never enter argv (ZIM-2069).
+  const envFile = envEntries.length > 0
+    ? await writeRemoteEnvFile({ config: input.spec, authArgs: auth.args, envEntries })
+    : null;
+
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
   const remoteScript = [
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -1230,9 +1332,8 @@ export async function buildSshSpawnTarget(input: {
     'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
     '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
     `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
+    ...(envFile ? [envFile.sourceScript] : []),
+    `exec ${remoteCommandParts}`,
   ].join(" && ");
 
   sshArgs.push(
@@ -1245,7 +1346,13 @@ export async function buildSshSpawnTarget(input: {
   return {
     command: "ssh",
     args: sshArgs,
-    cleanup: auth.cleanup,
+    cleanup: async () => {
+      // Runs after the remote process exits. The remote script already removed
+      // the file when it sourced it; this covers the never-connected case.
+      // Remove before dropping the temp key/known-hosts files it needs.
+      await envFile?.remove();
+      await auth.cleanup();
+    },
   };
 }
 
