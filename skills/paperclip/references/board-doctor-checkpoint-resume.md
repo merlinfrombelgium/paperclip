@@ -140,6 +140,56 @@ An unfinished sweep is the **expected steady state**, not a failure. `apply` exi
 converging. Report progress as `N/M items, K remaining` and keep the issue on a live
 continuation path until the worklist is empty.
 
+## What a write costs
+
+The counter counts **gated writes, not work items**. Read off `routes/issues.js` in the
+shipped build, there are exactly three gated surfaces:
+
+| Surface | Charged as |
+| - | - |
+| `PATCH /api/issues/:id` — any field change | one `update` |
+| `PATCH /api/issues/:id` — a `comment` field on that same request | one *additional* `comment` |
+| `POST /api/issues/:id/comments` | one `comment` |
+
+So **folding a per-card note into the PATCH does not save budget** — it is two counter
+trips either way. Issue documents and issue creation are not gated at all.
+
+`WorkItem.cost` encodes this, and the budget gate charges in cap units. A sweep of
+patch-plus-comment items therefore clears half as many cards a heartbeat.
+
+**Rule: one gated write per card.** Patch the fields, and say everything else in a single
+summary comment on the sweep's source issue — self-writes are free, so the whole narrative
+costs nothing. Reserve per-card comments for repairs whose note is the entire point and
+cannot be inferred from the field change. This is the biggest lever on convergence speed:
+the worst observed pass (78 writes / 77 targets) takes ~8 heartbeats at 2 writes per card
+and ~4 at one.
+
+There is also a sharp edge at the boundary. Both guards run **before** any mutation, so a
+2-cost PATCH that clears the `update` guard and then trips the `comment` guard is charged
+for the update and still writes nothing — budget burned, card untouched. Combining is
+therefore strictly *worse* than splitting at the cap edge. The engine never straddles it,
+because the budget gate stops before any item it cannot fully afford; hand-rolled sweep
+writes outside the engine can.
+
+An item that costs more than a whole heartbeat's budget is parked as `failed_permanent`
+rather than re-tripping the gate forever.
+
+## The refusal is not observable before 2026-08-11
+
+The shipped code derives `mode = now >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" :
+"log_only"` and, while `log_only`, returns `allowed: true` no matter how far past the cap
+the count has gone. Every write still lands and is still logged with its true `count`.
+
+Two consequences:
+
+- **A sweep that overshoots today does so silently.** The only signal is the
+  `issue.cross_issue_influence_observed` activity rows showing `count > cap`. This is how
+  the 78-write sweep on run `7f0de392` went unnoticed.
+- **The refusal path cannot be exercised against the live control plane until the
+  enforcement date.** Until then it is covered by the fake board in the test suite only.
+
+This is why the budget gate, not the refusal handler, is the load-bearing mechanism.
+
 ## Supported ops
 
 - `patch_issue` — `PATCH /api/issues/{id}` with `payload`; verifiable
@@ -147,29 +197,6 @@ continuation path until the worklist is empty.
 
 Add new ops in `Sweeper._apply_one`, and give them a `verify` shape wherever the repair is
 observable on the target.
-
-## Budget per card — keep it at 1
-
-The cap counts **gated writes, not cards**, and this is the single biggest lever on how many
-heartbeats a sweep takes. Verified against the shipped build
-(`routes/issues.js`, `assertCrossIssueInfluenceWithinRunCap`): the PATCH handler calls the
-counter **twice on one request** — once with kind `update` when any field changes, and again
-with kind `comment` when the body carries a `comment`. Folding a note into the PATCH does
-**not** make it one write. There is no cheaper combined surface.
-
-So a card repaired with an update *and* a note costs 2, halving the run to 10 cards. The
-78-write sweep takes ~8 heartbeats that way, ~4 at one write per card.
-
-**Rule: one gated write per card.** Patch the fields, and say everything else in a single
-summary comment on the sweep's own source issue — self-writes are free and uncounted, so
-the whole narrative costs nothing. Reserve per-card comments for repairs whose note is the
-entire point and cannot be inferred from the field change.
-
-There is also a sharp edge at the boundary: the two guards run **before** any mutation, so a
-2-cost PATCH that clears the `update` guard and trips on the `comment` guard is charged for
-the update and still writes nothing. `WorkItem.cost` prices patch-plus-comment at 2 and the
-budget gate stops before an item it cannot fully afford, so the engine never straddles the
-cap this way — but hand-rolled writes outside the engine can.
 
 ## Other refusals
 
