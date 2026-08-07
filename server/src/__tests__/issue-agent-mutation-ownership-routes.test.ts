@@ -26,6 +26,7 @@ const mockIssueService = vi.hoisted(() => ({
   listAttachments: vi.fn(),
   listComments: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  readRunLockState: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
@@ -417,6 +418,15 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listComments.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.readRunLockState.mockReset();
+    // Default: the owner really does hold a live checkout, which is what the
+    // "active checkout" cases below are about. Phantom-lock cases override this.
+    mockIssueService.readRunLockState.mockResolvedValue({
+      live: true,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      executionLockedAt: new Date("2026-08-02T20:42:49Z"),
+    });
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockReset();
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument.mockReset();
@@ -760,6 +770,72 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  // ZIM-2077: an `in_progress` issue whose assignee is down and which has no run
+  // record at all is not checked out by anyone. Refusing the write as a checkout
+  // conflict deadlocks the card — the status can never change, because being
+  // `in_progress` is the only thing proving the lock. The refusal must key off a
+  // real run record, so this phantom case behaves exactly like the same owner's
+  // `blocked` issues rather than being uniquely unwritable.
+  describe("phantom run-checkout lock", () => {
+    beforeEach(() => {
+      mockIssueService.readRunLockState.mockResolvedValue({
+        live: false,
+        checkoutRunId: null,
+        executionRunId: null,
+        executionLockedAt: null,
+      });
+      mockAgentService.getById.mockImplementation(async (id: string) =>
+        makeAgent(id, id === ownerAgentId ? { status: "error", errorReason: "HTTP 429: The usage limit has been reached" } : {}),
+      );
+    });
+
+    it("does not report a checkout conflict when no run record backs the in_progress status", async () => {
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).not.toBe(409);
+      expect(res.body.error).not.toBe("Issue is checked out by another agent");
+      expect(mockIssueService.readRunLockState).toHaveBeenCalledWith(issueId);
+    });
+
+    it("treats a phantom-locked in_progress issue the same as a blocked one for the same down owner", async () => {
+      const phantom = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done" });
+
+      mockIssueService.getById.mockResolvedValue(
+        makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }),
+      );
+      const blocked = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done" });
+
+      // The discriminator in the bug report was status alone: the `blocked` card
+      // owned by the same down agent patched fine while the `in_progress` one
+      // was refused. Both must now resolve identically.
+      expect(phantom.status, JSON.stringify(phantom.body)).toBe(blocked.status);
+    });
+
+    it("still reports a checkout conflict when a run really is live", async () => {
+      mockIssueService.readRunLockState.mockResolvedValue({
+        live: true,
+        checkoutRunId: ownerRunId,
+        executionRunId: ownerRunId,
+        executionLockedAt: new Date("2026-08-02T20:42:49Z"),
+      });
+
+      const res = await request(await createApp(peerActor()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "done" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body.error).toBe("Issue is checked out by another agent");
+      expect(res.body.details.checkoutRunId).toBe(ownerRunId);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {

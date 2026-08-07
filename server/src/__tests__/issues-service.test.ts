@@ -4510,6 +4510,38 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row?.executionLockedAt).toBeInstanceOf(Date);
   });
 
+  // ZIM-2077: `in_progress` is not evidence of a checkout. These pin the three
+  // shapes the mutation guard depends on.
+  it("reports no live run lock for an in_progress issue that never had a run", async () => {
+    const { issueId } = await seedIssueWithRun(null);
+
+    await expect(svc.readRunLockState(issueId)).resolves.toEqual({
+      live: false,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionLockedAt: null,
+    });
+  });
+
+  it("reports no live run lock once the holding run has reached a terminal status", async () => {
+    const { issueId } = await seedIssueWithRun("failed");
+
+    const state = await svc.readRunLockState(issueId);
+
+    expect(state.live).toBe(false);
+    expect(state.executionRunId).toBeNull();
+    expect(state.executionLockedAt).toBeNull();
+  });
+
+  it("reports a live run lock while the holding run is still running", async () => {
+    const { issueId, runId } = await seedIssueWithRun("running");
+
+    const state = await svc.readRunLockState(issueId);
+
+    expect(state.live).toBe(true);
+    expect(state.executionRunId).toBe(runId);
+  });
+
   it("does not update issues without an execution lock", async () => {
     const { issueId } = await seedIssueWithRun(null);
 

@@ -2169,13 +2169,23 @@ export function issueRoutes(
       if (await hasActiveCheckoutManagementOverride(actorAgentId, issue.companyId, issue.assigneeAgentId)) {
         return true;
       }
-      if (issue.status === "in_progress") {
+      // Refuse only when a run actually holds the issue. `in_progress` on its
+      // own is not a checkout: an issue can reach that status without a run ever
+      // being minted, and if the assignee is then down the card can never leave
+      // `in_progress` — because being `in_progress` is what proves the lock that
+      // blocks the status change. That deadlock has no live actor to wait for
+      // and neither named escape path is reachable, so key off the run record
+      // instead (ZIM-2077).
+      const runLock = issue.status === "in_progress" ? await svc.readRunLockState(issue.id) : null;
+      if (runLock?.live) {
         res.status(409).json({
           error: "Issue is checked out by another agent",
           details: {
             issueId: issue.id,
             assigneeAgentId: issue.assigneeAgentId,
             actorAgentId,
+            checkoutRunId: runLock.checkoutRunId,
+            executionRunId: runLock.executionRunId,
           },
         });
       } else {

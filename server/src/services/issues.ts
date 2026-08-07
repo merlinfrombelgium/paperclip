@@ -4365,9 +4365,43 @@ export function issueService(db: Db) {
     });
   }
 
+  // Resolves whether an issue is actually held by a live run, as opposed to
+  // merely *looking* held because it sits in `in_progress`. Status is not
+  // evidence of a checkout: an issue can be moved to `in_progress` by an
+  // assignment/transition path that never mints a run, and if its assignee then
+  // goes down it can never leave that status — being `in_progress` is what
+  // proves the lock that prevents anyone from changing the status (ZIM-2077).
+  //
+  // Terminal/vanished runs are cleared first so a run that has already ended
+  // never reads as live. After that, only a surviving run id is a real claim.
+  // `executionLockedAt` is reported for diagnostics but deliberately does not by
+  // itself constitute a lock: a timestamp with no run id behind it names no
+  // actor to hand the work back to, which is the same phantom in another shape.
+  async function readRunLockState(issueId: string) {
+    await clearExecutionRunIfTerminal(issueId);
+    await clearCheckoutRunIfTerminal(issueId);
+    const row = await db
+      .select({
+        checkoutRunId: issues.checkoutRunId,
+        executionRunId: issues.executionRunId,
+        executionLockedAt: issues.executionLockedAt,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!row) return { live: false, checkoutRunId: null, executionRunId: null, executionLockedAt: null };
+    return {
+      live: row.checkoutRunId != null || row.executionRunId != null,
+      checkoutRunId: row.checkoutRunId,
+      executionRunId: row.executionRunId,
+      executionLockedAt: row.executionLockedAt,
+    };
+  }
+
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    readRunLockState,
 
     list: async (companyId: string, filters?: IssueFilters) => {
       if (filters?.attention === "blocked") {

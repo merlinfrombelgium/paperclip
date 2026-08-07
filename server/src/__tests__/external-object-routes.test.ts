@@ -11,6 +11,7 @@ const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   getById: vi.fn(),
+  readRunLockState: vi.fn(),
 }));
 
 const mockAccessService = vi.hoisted(() => ({
@@ -159,6 +160,14 @@ describe("external object routes", () => {
     vi.resetAllMocks();
     mockIssueService.getById.mockResolvedValue(makeIssue());
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    // The peer-refusal case below is about a genuinely live checkout, so the
+    // owner really holds one (ZIM-2077: status alone no longer implies a lock).
+    mockIssueService.readRunLockState.mockResolvedValue({
+      live: true,
+      checkoutRunId: ownerRunId,
+      executionRunId: ownerRunId,
+      executionLockedAt: new Date("2026-08-02T20:42:49Z"),
+    });
     mockAccessService.hasPermission.mockResolvedValue(false);
     mockAccessService.decide.mockImplementation(async ({ action }: { action: string }) => ({
       allowed: action === "issue:mutate",

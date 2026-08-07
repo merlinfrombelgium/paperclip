@@ -795,11 +795,19 @@ async function assertIssueLinkMutationAllowed(
   if (!actorAgentId) throw forbidden("Agent authentication required");
   if (input.issue.assigneeAgentId === null) return;
   if (input.issue.assigneeAgentId !== actorAgentId) {
-    if (input.issue.status === "in_progress") {
+    // Same phantom-lock guard as the issue mutation route: `in_progress` alone
+    // is not a checkout, so only a surviving run record may raise a conflict
+    // here (ZIM-2077).
+    const runLock = input.issue.status === "in_progress"
+      ? await input.issuesSvc.readRunLockState(input.issue.id)
+      : null;
+    if (runLock?.live) {
       throw conflict("Issue is checked out by another agent", {
         issueId: input.issue.id,
         assigneeAgentId: input.issue.assigneeAgentId,
         actorAgentId,
+        checkoutRunId: runLock.checkoutRunId,
+        executionRunId: runLock.executionRunId,
       });
     }
     throw forbidden("Agent cannot mutate another agent's issue");
