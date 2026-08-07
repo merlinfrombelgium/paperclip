@@ -33,6 +33,26 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 const BUILD_TIMEOUT_MS = 60_000;
 const TEST_TIMEOUT_MS = 30_000;
 
+/**
+ * Set to "1" to turn every environment-based skip in this file into a failure.
+ *
+ * A skip here is a bare `return` with no assertions, which vitest reports as a
+ * passing test. That is not hypothetical: on 2026-08-07 this file reported
+ * `Tests 3 passed (3)` while executing nothing at all, because a concurrent
+ * run's workspace sync-back had left `node_modules/esbuild` a dangling symlink
+ * into a deleted directory, so the bundle step threw and all three tests
+ * early-returned. A gate that cannot fail gives false assurance on exactly the
+ * finding it exists to hold closed, so sign-off runs set this.
+ */
+const REQUIRE_GATE_ENV = "PAPERCLIP_REQUIRE_SSH_GATE";
+
+function skipOrFail(reason: string): void {
+  if (process.env[REQUIRE_GATE_ENV] === "1") {
+    expect.fail(`${REQUIRE_GATE_ENV}=1, but the gate could not run: ${reason}`);
+  }
+  console.warn(`Skipping: ${reason}`);
+}
+
 const sshModulePath = fileURLToPath(new URL("./ssh.ts", import.meta.url));
 
 /**
@@ -161,7 +181,7 @@ describe("staged SSH credentials do not survive abnormal termination", () => {
     onDiskKey: boolean;
   }): Promise<StagedChild | null> {
     if (!bundlePath) {
-      console.warn(`Skipping: could not bundle the child harness (${unsupportedReason ?? "unknown"})`);
+      skipOrFail(`could not bundle the child harness (${unsupportedReason ?? "unknown"})`);
       return null;
     }
 
@@ -270,7 +290,7 @@ describe("staged SSH credentials do not survive abnormal termination", () => {
     "kills the identity agent and removes its socket directory on termination",
     async () => {
       if (!keyIsReal) {
-        console.warn("Skipping: ssh-keygen unavailable, cannot produce a loadable identity");
+        skipOrFail("ssh-keygen unavailable, cannot produce a loadable identity");
         return;
       }
       const tmpDir = await scratch();
@@ -279,7 +299,7 @@ describe("staged SSH credentials do not survive abnormal termination", () => {
       if (!child.socketPath) {
         // No ssh-agent on PATH: the default path fails closed, which its own
         // test covers. Nothing to assert about cleanup here.
-        console.warn(`Skipping: default agent path unavailable (${child.stderr().trim()})`);
+        skipOrFail(`default agent path unavailable (${child.stderr().trim()})`);
         return;
       }
 

@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import {
   constants as fsConstants,
   createReadStream,
   createWriteStream,
   promises as fs,
+  readFileSync,
   rmSync,
 } from "node:fs";
 import net from "node:net";
@@ -378,17 +379,60 @@ async function resolveCommandPath(command: string): Promise<string | null> {
  * with it.
  */
 const strandedSshTempDirs = new Set<string>();
-const strandedSshAgentPids = new Set<number>();
+/** Agent pid -> the socket path it was started for, which identifies it as ours. */
+const strandedSshAgentPids = new Map<number, string>();
 const TERMINATION_SIGNALS: NodeJS.Signals[] = ["SIGHUP", "SIGINT", "SIGTERM"];
 let emergencySshCleanupInstalled = false;
 
+/**
+ * Whether `pid` is still the ssh-agent we started for `socketPath`.
+ *
+ * A registered pid is not proof the agent is still alive: an agent can die on
+ * its own (the `-t` lifetime expires the identity but does not exit the agent,
+ * so this means a crash or an outside kill), and the run holding the
+ * registration lives for hours, which is ample time for the pid to be recycled
+ * onto something unrelated. SIGKILLing a recycled pid would take out another
+ * process on a host where every agent shares one uid. `ssh-agent -a
+ * <socketPath>` puts both the program name and our per-invocation socket path
+ * into argv, and that pair identifies the process as ours.
+ *
+ * Synchronous because the `exit` handler cannot await. Failing to read the
+ * process at all means it is gone, which is precisely when not killing is the
+ * correct answer, so every error path returns false.
+ *
+ * @internal Exported only so ssh-agent-pid-guard.test.ts can pin the
+ * discrimination against a real, non-ssh-agent process.
+ */
+export function isOurSshAgentProcess(pid: number, socketPath: string): boolean {
+  let argv: string;
+  try {
+    argv =
+      process.platform === "linux"
+        ? readFileSync(`/proc/${pid}/cmdline`, "utf8")
+        : execFileSync("ps", ["-o", "args=", "-p", String(pid)], {
+            encoding: "utf8",
+            timeout: SSH_AGENT_COMMAND_TIMEOUT_MS,
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+  } catch {
+    return false;
+  }
+  return argv.includes("ssh-agent") && argv.includes(socketPath);
+}
+
+/** SIGKILLs `pid`, but only while it is still our agent for `socketPath`. */
+function killSshAgentPid(pid: number, socketPath: string): void {
+  if (!isOurSshAgentProcess(pid, socketPath)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Exited between the check and the signal — fine.
+  }
+}
+
 function runEmergencySshCleanup(): void {
-  for (const pid of strandedSshAgentPids) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // Already gone, or never ours to signal.
-    }
+  for (const [pid, socketPath] of strandedSshAgentPids) {
+    killSshAgentPid(pid, socketPath);
   }
   strandedSshAgentPids.clear();
   for (const dir of strandedSshTempDirs) {
@@ -434,8 +478,8 @@ function trackStrandedSshTempDir(dir: string): () => void {
 }
 
 /** Registers `pid` for an emergency SIGKILL; returns the deregistration hook. */
-function trackStrandedSshAgentPid(pid: number): () => void {
-  strandedSshAgentPids.add(pid);
+function trackStrandedSshAgentPid(pid: number, socketPath: string): () => void {
+  strandedSshAgentPids.set(pid, socketPath);
   installEmergencySshCleanup();
   return () => {
     strandedSshAgentPids.delete(pid);
@@ -565,7 +609,7 @@ async function startSshIdentityAgent(privateKey: string): Promise<SshIdentityAge
   const agentPid = parseSshAgentPid(startOutput.stdout);
   // The agent holds the key in its own memory, so an agent that outlives this
   // process outlives the only thing bounding its exposure to the shared uid.
-  const untrackPid = agentPid == null ? () => {} : trackStrandedSshAgentPid(agentPid);
+  const untrackPid = agentPid == null ? () => {} : trackStrandedSshAgentPid(agentPid, socketPath);
   const killAgent = async () => {
     untrackPid();
     if (agentPid == null) {
@@ -583,13 +627,9 @@ async function startSshIdentityAgent(privateKey: string): Promise<SshIdentityAge
       maxBuffer: 16 * 1024,
       env: { ...process.env, SSH_AUTH_SOCK: socketPath, SSH_AGENT_PID: String(agentPid) },
     }).catch(() => undefined);
-    if (await isPidRunning(agentPid)) {
-      try {
-        process.kill(agentPid, "SIGKILL");
-      } catch {
-        // Already gone between the check and the signal — fine.
-      }
-    }
+    // `ssh-agent -k` is the clean path; the SIGKILL is only a fallback for when
+    // it did not take, and it verifies the pid is still ours before firing.
+    killSshAgentPid(agentPid, socketPath);
   };
 
   try {

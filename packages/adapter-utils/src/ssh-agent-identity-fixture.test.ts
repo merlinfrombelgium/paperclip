@@ -39,7 +39,34 @@ import {
  */
 
 const SSH_FIXTURE_TEST_TIMEOUT_MS = 60_000;
+/** Full sweep: recursive file walk plus a scan of every /proc/<pid>/cmdline. */
 const WATCH_INTERVAL_MS = 25;
+/**
+ * Agent-directory poll, deliberately far tighter than the full sweep.
+ *
+ * A `paperclip-ssh-agent-*` directory can exist for as little as ~400ms, and a
+ * single full sweep can outlast that window on a loaded host — the /proc scan
+ * alone opens every pid on the machine. Observing the directory needs only one
+ * `readdir` plus a `stat` of the matching entries, so it runs on its own timer
+ * and is never blocked behind a sweep in flight.
+ */
+const AGENT_DIR_POLL_INTERVAL_MS = 4;
+
+/**
+ * Set to "1" to turn every environment-based skip in this file into a failure.
+ *
+ * `if (!fixture) return;` is a test with no assertions, which vitest reports as
+ * a pass — so a host with no sshd, or a broken fixture, reports this gate green
+ * without running it. Sign-off runs set this so the gate can actually fail.
+ */
+const REQUIRE_GATE_ENV = "PAPERCLIP_REQUIRE_SSH_GATE";
+
+function skipOrFail(reason: string): void {
+  if (process.env[REQUIRE_GATE_ENV] === "1") {
+    expect.fail(`${REQUIRE_GATE_ENV}=1, but the gate could not run: ${reason}`);
+  }
+  console.warn(`Skipping: ${reason}`);
+}
 
 interface LeakWatcher {
   /** Files under the scan root found to contain the key material. */
@@ -73,6 +100,29 @@ function startLeakWatcher(input: { scanRoot: string; sentinel: string }): LeakWa
   const keyFileDirs: string[] = [];
   let running = false;
 
+  /**
+   * The cheap half: which staging directories existed, and with what mode.
+   *
+   * Split out of `sweep` so it is not starved behind an in-flight full sweep.
+   * Two syscalls per tick, so it can poll fast enough to land inside the short
+   * window an agent directory is alive for.
+   */
+  const pollStagingDirs = async (): Promise<void> => {
+    for (const entry of await readdir(input.scanRoot, { withFileTypes: true }).catch(() => [])) {
+      if (!entry.isDirectory()) continue;
+      const full = path.join(input.scanRoot, entry.name);
+      if (entry.name.startsWith("paperclip-ssh-agent-")) {
+        const mode = (await stat(full).catch(() => null))?.mode;
+        // Record the tightest mode seen: a directory that was ever laxer than
+        // 0700, even briefly, is a finding.
+        if (mode != null) agentDirs.set(full, Math.max(agentDirs.get(full) ?? 0, mode & 0o777));
+      }
+      if (entry.name.startsWith("paperclip-ssh-key-") && !keyFileDirs.includes(full)) {
+        keyFileDirs.push(full);
+      }
+    }
+  };
+
   const sweep = async (): Promise<void> => {
     if (running) return;
     running = true;
@@ -82,17 +132,7 @@ function startLeakWatcher(input: { scanRoot: string; sentinel: string }): LeakWa
         if (contents.includes(input.sentinel) && !fileHits.includes(file)) fileHits.push(file);
       });
 
-      for (const entry of await readdir(input.scanRoot, { withFileTypes: true }).catch(() => [])) {
-        if (!entry.isDirectory()) continue;
-        const full = path.join(input.scanRoot, entry.name);
-        if (entry.name.startsWith("paperclip-ssh-agent-")) {
-          const mode = (await stat(full).catch(() => null))?.mode;
-          if (mode != null) agentDirs.set(full, mode & 0o777);
-        }
-        if (entry.name.startsWith("paperclip-ssh-key-") && !keyFileDirs.includes(full)) {
-          keyFileDirs.push(full);
-        }
-      }
+      await pollStagingDirs();
 
       // The adversary's actual view: /proc/<pid>/cmdline is world readable, so
       // any key that reaches argv is one `ps` away from every other agent.
@@ -115,6 +155,10 @@ function startLeakWatcher(input: { scanRoot: string; sentinel: string }): LeakWa
     void sweep();
   }, WATCH_INTERVAL_MS);
   timer.unref?.();
+  const dirTimer = setInterval(() => {
+    void pollStagingDirs();
+  }, AGENT_DIR_POLL_INTERVAL_MS);
+  dirTimer.unref?.();
 
   return {
     fileHits,
@@ -124,6 +168,7 @@ function startLeakWatcher(input: { scanRoot: string; sentinel: string }): LeakWa
     sweep,
     stop: async () => {
       clearInterval(timer);
+      clearInterval(dirTimer);
       // Let an in-flight sweep settle, then take a final one.
       await new Promise((resolve) => setTimeout(resolve, WATCH_INTERVAL_MS));
       await sweep();
@@ -196,13 +241,13 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
   /** Fixture root deliberately lives outside the scanned TMPDIR. See header. */
   async function startFixtureOrSkip(label: string) {
     if (unsupportedReason) {
-      console.warn(`Skipping ${label}: ${unsupportedReason}`);
+      skipOrFail(`${label}: ${unsupportedReason}`);
       return null;
     }
     const support = await getSshEnvLabSupport();
     if (!support.supported) {
       unsupportedReason = support.reason ?? "unsupported environment";
-      console.warn(`Skipping ${label}: ${unsupportedReason}`);
+      skipOrFail(`${label}: ${unsupportedReason}`);
       return null;
     }
     const fixtureRoot = await mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-fixture-"));
@@ -212,7 +257,7 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
       return { started, fixtureRoot };
     } catch (error) {
       unsupportedReason = error instanceof Error ? error.message : String(error);
-      console.warn(`Skipping ${label}: ${unsupportedReason}`);
+      skipOrFail(`${label}: ${unsupportedReason}`);
       return null;
     }
   }
@@ -305,13 +350,17 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
     // The pre-fix artifact never appears at all.
     expect(watcher.keyFileDirs).toEqual([]);
 
-    // The agent path actually ran, and its socket directory was 0700 every
-    // time we looked and is gone now.
-    expect(watcher.agentDirs.size).toBeGreaterThan(0);
+    // Every socket directory we saw was 0700 every time we looked, and is gone
+    // now. Ordered before the self-check below so a sampler that missed a
+    // window cannot suppress these.
     for (const [dir, mode] of watcher.agentDirs) {
       expect(`${dir}: ${mode.toString(8)}`).toBe(`${dir}: 700`);
       await expect(stat(dir)).rejects.toThrow();
     }
+    expect(await readdir(scanRoot)).toEqual([]);
+
+    // Self-check: the agent path actually ran.
+    expect(watcher.agentDirs.size).toBeGreaterThan(0);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("removes the agent socket directory when the ssh call throws", async () => {
@@ -335,14 +384,21 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
       await stopSshEnvLabFixture(path.join(fixtureRoot, "state.json")).catch(() => undefined);
     }
 
+    // Product assertions first. `agentDirs.size` below is the watcher's own
+    // self-check, and asserting it ahead of these once meant a sampler that
+    // missed a ~400ms window threw before the cleanup checks ever ran — the
+    // gate's most important assertions were the ones it skipped when it failed.
     expect(watcher.fileHits).toEqual([]);
     expect(watcher.argvHits).toEqual([]);
-    expect(watcher.agentDirs.size).toBeGreaterThan(0);
     for (const dir of watcher.agentDirs.keys()) {
       await expect(stat(dir)).rejects.toThrow();
     }
-    // Nothing at all is left behind under the scan root.
+    // Nothing at all is left behind under the scan root. This holds whether or
+    // not the sampler caught the directory, so it is the load-bearing one.
     expect(await readdir(scanRoot)).toEqual([]);
+
+    // Now the self-check: the agent path really did run on the error path.
+    expect(watcher.agentDirs.size).toBeGreaterThan(0);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
   it("expires the identity while an already-established session keeps running", async () => {
