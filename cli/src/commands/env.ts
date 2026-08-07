@@ -1,5 +1,6 @@
 import * as p from "@clack/prompts";
 import pc from "picocolors";
+import { isSecretEnvVarName } from "@paperclipai/adapter-utils";
 import type { PaperclipConfig } from "../config/schema.js";
 import { configExists, readConfig, resolveConfigPath } from "../config/store.js";
 import {
@@ -76,7 +77,7 @@ export async function envCommand(opts: { config?: string }): Promise<void> {
         missing: "missing",
       }[entry.source];
       p.log.message(
-        `${pc.cyan(entry.key)} ${status.padEnd(7)} ${pc.dim(`[${sourceNote}] ${entry.note}`)}${entry.source === "missing" ? "" : ` ${pc.dim("=>")} ${pc.white(quoteShellValue(entry.value))}`}`,
+        `${pc.cyan(entry.key)} ${status.padEnd(7)} ${pc.dim(`[${sourceNote}] ${entry.note}`)}${entry.source === "missing" ? "" : ` ${pc.dim("=>")} ${pc.white(displayValue(entry))}`}`,
       );
     }
   };
@@ -403,6 +404,15 @@ function uniqueByKey(rows: EnvVarRow[]): EnvVarRow[] {
     result.push(row);
   }
   return result;
+}
+
+// The inventory line is a diagnostic, so it never needs the value itself — only
+// whether one is present and how long it is. Printing it put the JWT signing
+// secret into captured stdout and from there onto disk (ZIM-2114); the length
+// is enough to tell a truncated value from a good one.
+function displayValue(entry: EnvVarRow): string {
+  if (!isSecretEnvVarName(entry.key)) return quoteShellValue(entry.value);
+  return `[redacted, len=${entry.value.length}]`;
 }
 
 function quoteShellValue(value: string): string {
