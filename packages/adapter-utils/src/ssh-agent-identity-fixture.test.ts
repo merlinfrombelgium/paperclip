@@ -352,8 +352,14 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
     const config = await buildSshEnvLabFixtureConfig(started);
     const spec = { ...config, remoteCwd: started.workspaceDir } as const;
 
+    // Short enough to expire inside the test, long enough to comfortably cover
+    // connection setup. Anything tighter (1s was tried) races the handshake on
+    // a loaded machine and fails to authenticate at all — which is itself the
+    // reason the production value is 120s rather than "just above the
+    // handshake": the margin has to absorb a busy host.
     const previousTtl = process.env.PAPERCLIP_SSH_AGENT_IDENTITY_TTL_SECONDS;
-    process.env.PAPERCLIP_SSH_AGENT_IDENTITY_TTL_SECONDS = "1";
+    process.env.PAPERCLIP_SSH_AGENT_IDENTITY_TTL_SECONDS = "5";
+    const expiryWaitMs = 7_000;
 
     let target: Awaited<ReturnType<typeof buildSshSpawnTarget>> | null = null;
     try {
@@ -361,6 +367,9 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
       // for the hours-long agent process that resolveSpawnTarget starts.
       target = await buildSshSpawnTarget({ spec, command: "cat", args: [], env: {} });
       const socketPath = identityAgentSocket(target.args);
+      // Checked before anything else touches the wire, so this is a statement
+      // about the load, not a race against the lifetime.
+      expect(await listAgentIdentities(socketPath)).toContain("ED25519");
 
       const child = spawn(target.command, target.args, { stdio: ["pipe", "pipe", "pipe"] });
       try {
@@ -383,10 +392,9 @@ describe("ZIM-2088 gate: SSH key material never reaches disk or argv", () => {
 
         child.stdin.write("before-expiry\n");
         expect(await readLine()).toBe("before-expiry");
-        expect(await listAgentIdentities(socketPath)).toContain("ED25519");
 
-        // Past the 1s lifetime.
-        await new Promise((resolve) => setTimeout(resolve, 2_500));
+        // Past the configured lifetime.
+        await new Promise((resolve) => setTimeout(resolve, expiryWaitMs));
 
         // The credential is no longer usable...
         expect(await listAgentIdentities(socketPath)).toContain("no identities");
