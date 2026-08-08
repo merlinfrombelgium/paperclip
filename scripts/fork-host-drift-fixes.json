@@ -1,0 +1,23 @@
+[
+  {
+    "issueId": "ZIM-2082",
+    "title": "Move SSH agent env off the local ssh argv",
+    "forkCommit": "f65202d471c5f34164d956b1c7d61ab8941c5c41",
+    "landedInForkAt": "2026-08-07",
+    "upstreamMergedAt": null
+  },
+  {
+    "issueId": "ZIM-2087",
+    "title": "Redact shell-escaped secret assignments in captured output",
+    "forkCommit": "0eedc2a6049edd8e3b50857fcb18ceccae6b5e34",
+    "landedInForkAt": "2026-08-07",
+    "upstreamMergedAt": null
+  },
+  {
+    "issueId": "ZIM-2090",
+    "title": "Remove staged SSH credentials on abnormal termination / load SSH identity into a per-invocation agent",
+    "forkCommit": "047e3d6b3ab78ff2f254ca79ae3455d5f8071299",
+    "landedInForkAt": "2026-08-07",
+    "upstreamMergedAt": null
+  }
+]
