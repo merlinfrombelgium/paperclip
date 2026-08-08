@@ -58,9 +58,22 @@ export {
 } from "./log-redaction.js";
 export {
   REDACTED_COMMAND_TEXT_VALUE,
+  installProcessEnvSecretValueSource,
   isSecretEnvVarName,
   redactCommandText,
 } from "./command-redaction.js";
+export type { SecretValueSource } from "./secret-value-registry.js";
+export {
+  SECRET_VALUE_MIN_LENGTH,
+  getSecretValueCandidates,
+  invalidateSecretValueCandidates,
+  isRedactableSecretValue,
+  redactKnownSecretValues,
+  registerSecretValueSource,
+  registerSecretValues,
+  resetSecretValueRegistryForTests,
+  secretValueVariants,
+} from "./secret-value-registry.js";
 export { buildSandboxNpmInstallCommand } from "./sandbox-install-command.js";
 export { createRuntimeProgressReporter } from "./runtime-progress.js";
 export type {

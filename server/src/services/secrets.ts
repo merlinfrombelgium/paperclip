@@ -56,6 +56,7 @@ import type {
 } from "../secrets/types.js";
 import { isSecretProviderClientError } from "../secrets/types.js";
 import { authorizationService } from "./authorization.js";
+import { registerResolvedSecretValue } from "./known-secret-values.js";
 import { findActiveServerAdapter } from "../adapters/index.js";
 
 const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
@@ -672,6 +673,10 @@ export function secretService(db: Db) {
           version: resolvedVersion,
         },
       });
+      // A resolved binding value exists only in flight, so no source can poll for
+      // it. Hand it to the redactor now (ZIM-2174) — before it can reach a
+      // command line, an env report, or a run log.
+      registerResolvedSecretValue(value);
       await Promise.all([
         db
           .update(companySecrets)
