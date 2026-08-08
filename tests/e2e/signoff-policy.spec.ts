@@ -87,7 +87,55 @@ async function agentPatch(
     headers: { "X-Paperclip-Run-Id": runId },
     data,
   });
-  return res;
+  if (res.status() !== 409) return res;
+  // Same race as in agentCheckoutAndPatch: the run started by invokeHeartbeat can
+  // take the lock before our PATCH lands. Retry under whoever holds it. No board
+  // checkout fallback here — reviewers/approvers must not be checked out, since
+  // that would force in_progress and break the in_review state under test.
+  const { res: recoveredRes } = await patchUnderCurrentRunLock(board, agent, issueId, runId, data);
+  return recoveredRes;
+}
+
+/**
+ * Re-read who actually holds the issue's run lock and PATCH under that run id.
+ *
+ * `invokeHeartbeat` POSTs to `/heartbeat/invoke`, which is a 202 — a real run
+ * starts in the background and can take the lock out from under us between our
+ * checkout and our PATCH. Re-resolving the lock is the recovery for both a 409
+ * on the checkout and a 409 on the PATCH.
+ */
+async function patchUnderCurrentRunLock(
+  board: APIRequestContext,
+  agent: AgentAuth,
+  issueId: string,
+  fallbackRunId: string,
+  patchData: Record<string, unknown>,
+) {
+  const issueRunLock = await getIssueRunLockState(board, issueId);
+  const lockedRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId;
+  const res = await agent.request.patch(`${BASE_URL}/api/issues/${issueId}`, {
+    headers: { "X-Paperclip-Run-Id": lockedRunId ?? fallbackRunId },
+    data: patchData,
+  });
+  return { res, issueRunLock };
+}
+
+/** Board-owned last resort: check out on the agent's behalf, then PATCH as the board. */
+async function boardCheckoutAndPatch(
+  board: APIRequestContext,
+  agent: AgentAuth,
+  issueId: string,
+  expectedStatuses: string[],
+  patchData: Record<string, unknown>,
+) {
+  const boardCheckout = await board.post(`${BASE_URL}/api/issues/${issueId}/checkout`, {
+    data: { agentId: agent.agentId, expectedStatuses },
+  });
+  if (!boardCheckout.ok()) {
+    throw new Error(`Board checkout failed: ${await boardCheckout.text()}`);
+  }
+  // Board PATCH (executor mark-done triggers signoff regardless of actor)
+  return board.patch(`${BASE_URL}/api/issues/${issueId}`, { data: patchData });
 }
 
 /** Checkout an issue as an agent, then PATCH it. Used for executor mark-done. */
@@ -106,36 +154,35 @@ async function agentCheckoutAndPatch(
   });
   if (!checkoutRes.ok()) {
     if (checkoutRes.status() === 409) {
-      const issueRunLock = await getIssueRunLockState(board, issueId);
-      const lockedRunId = issueRunLock.checkoutRunId ?? issueRunLock.executionRunId;
-      const res = await agent.request.patch(`${BASE_URL}/api/issues/${issueId}`, {
-        headers: { "X-Paperclip-Run-Id": lockedRunId ?? runId },
-        data: patchData,
-      });
+      const { res, issueRunLock } = await patchUnderCurrentRunLock(
+        board, agent, issueId, runId, patchData,
+      );
       if (res.ok() && issueRunLock.assigneeAgentId === agent.agentId) {
         return res;
       }
     }
     // If agent checkout fails (e.g. run expired), fall back to board checkout
     // then PATCH with the agent's identity
-    const boardCheckout = await board.post(`${BASE_URL}/api/issues/${issueId}/checkout`, {
-      data: { agentId: agent.agentId, expectedStatuses },
-    });
-    if (!boardCheckout.ok()) {
-      throw new Error(`Board checkout failed: ${await boardCheckout.text()}`);
-    }
-    // Board PATCH (executor mark-done triggers signoff regardless of actor)
-    const res = await board.patch(`${BASE_URL}/api/issues/${issueId}`, {
-      data: patchData,
-    });
-    return res;
+    return boardCheckoutAndPatch(board, agent, issueId, expectedStatuses, patchData);
   }
+
   // PATCH with agent identity
   const res = await agent.request.patch(`${BASE_URL}/api/issues/${issueId}`, {
     headers: { "X-Paperclip-Run-Id": runId },
     data: patchData,
   });
-  return res;
+  if (res.status() !== 409) return res;
+
+  // Checkout succeeded but the PATCH raced the background run started by
+  // `invokeHeartbeat` and lost the lock. Same recovery ladder as the checkout
+  // 409 — re-resolve the lock holder, then fall back to the board. Without this
+  // the race surfaced as a hard suite failure (`expect(resubmitRes.ok())`)
+  // rather than a retry.
+  const recovered = await patchUnderCurrentRunLock(board, agent, issueId, runId, patchData);
+  if (recovered.res.ok() && recovered.issueRunLock.assigneeAgentId === agent.agentId) {
+    return recovered.res;
+  }
+  return boardCheckoutAndPatch(board, agent, issueId, expectedStatuses, patchData);
 }
 
 async function setupCompany(boardRequest: APIRequestContext): Promise<TestContext> {
