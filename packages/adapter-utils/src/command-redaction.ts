@@ -1,3 +1,5 @@
+import { redactKnownSecretValues, registerSecretValueSource } from "./secret-value-registry.js";
+
 export const REDACTED_COMMAND_TEXT_VALUE = "***REDACTED***";
 
 const SECRET_NAME_PATTERN =
@@ -77,14 +79,39 @@ export function isSecretEnvVarName(name: string): boolean {
   return SECRET_ENV_VAR_NAME_RE.test(name);
 }
 
+function* processEnvSecretValues(): Iterable<string> {
+  for (const [name, value] of Object.entries(process.env)) {
+    if (!value || !isSecretEnvVarName(name)) continue;
+    yield value;
+  }
+}
+
+/**
+ * Feed the secret-bearing entries of the process environment into the value
+ * candidate set. Read through on every rebuild rather than snapshotted, so a
+ * variable set after boot is still covered. Idempotent — the registry keys
+ * sources by identity — so tests call it again after resetting the registry.
+ */
+export function installProcessEnvSecretValueSource(): void {
+  registerSecretValueSource(processEnvSecretValues);
+}
+
+installProcessEnvSecretValueSource();
+
 function maybeContainsSecretText(command: string) {
   const lower = command.toLowerCase();
   return COMMAND_SECRET_HINTS.some((hint) => lower.includes(hint)) || command.includes(".");
 }
 
 export function redactCommandText(command: string, redactedValue = REDACTED_COMMAND_TEXT_VALUE): string {
-  if (!maybeContainsSecretText(command)) return command;
-  return command
+  // Value-based redaction runs first and unconditionally (ZIM-2174). It must not
+  // sit behind `maybeContainsSecretText`: an unanchored emission — a bare value
+  // under a file header, a value echoed inside a fenced block — carries none of
+  // the hints that gate looks for, so gating it would reintroduce the blind spot
+  // this pass exists to close.
+  const withoutKnownValues = redactKnownSecretValues(command, redactedValue);
+  if (!maybeContainsSecretText(withoutKnownValues)) return withoutKnownValues;
+  return withoutKnownValues
     .replace(COMMAND_AUTHORIZATION_BEARER_RE, `$1${redactedValue}`)
     .replace(COMMAND_CLI_SECRET_OPTION_RE, `$1$2${redactedValue}`)
     .replace(COMMAND_ENV_SECRET_ASSIGNMENT_RE, `$1$2${redactedValue}`)

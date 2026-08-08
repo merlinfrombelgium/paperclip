@@ -1,4 +1,11 @@
-import { redactCommandText } from "@paperclipai/adapter-utils";
+import { redactCommandText, redactKnownSecretValues } from "@paperclipai/adapter-utils";
+
+import { installKnownSecretValueSources } from "./services/known-secret-values.js";
+
+// Value-based redaction (ZIM-2174) needs the host's own secret material in its
+// candidate set before the first chunk is written, so the sources are installed
+// when this module loads rather than from a startup hook a caller might skip.
+installKnownSecretValueSources();
 
 const SECRET_FIELD_NAME_PATTERN =
   String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization|bearer|secret|passwd|password|credential|jwt|private[-_]?key|cookie|connectionstring)[A-Za-z0-9_-]*`;
@@ -52,6 +59,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function sanitizeValue(value: unknown): unknown {
   if (value === null || value === undefined) return value;
+  // Payload fields that are not secret-named were previously passed through
+  // untouched, so a known secret riding in an arbitrary string field reached the
+  // event log in clear. Value matching costs one substring scan and cannot
+  // over-redact anything the host does not already hold as a secret.
+  if (typeof value === "string") return redactKnownSecretValues(value, REDACTED_EVENT_VALUE);
   if (Array.isArray(value)) return value.map(sanitizeValue);
   if (isSecretRefBinding(value)) return value;
   if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value) };
@@ -124,9 +136,13 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 }
 
 export function redactSensitiveText(input: string): string {
-  if (!maybeContainsSecretText(input)) return input;
+  // Known secret values come out first and unconditionally (ZIM-2174): the
+  // hint gate below is a shape heuristic, and the leaks that keep getting through
+  // are precisely the ones with no shape to detect.
+  const withoutKnownValues = redactKnownSecretValues(input, REDACTED_EVENT_VALUE);
+  if (!maybeContainsSecretText(withoutKnownValues)) return withoutKnownValues;
   return redactCommandText(
-    input
+    withoutKnownValues
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(ESCAPED_JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`),
     REDACTED_EVENT_VALUE,
