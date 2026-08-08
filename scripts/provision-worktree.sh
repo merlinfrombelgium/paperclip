@@ -446,6 +446,18 @@ if [[ -f "$worktree_cwd/package.json" && -f "$worktree_cwd/pnpm-lock.yaml" ]]; t
       needs_install=1
       break
     fi
+
+    # target_path already exists as a real directory (not a symlink), which
+    # is the normal pnpm layout - but individual package entries inside it
+    # (e.g. node_modules/supertest) are themselves symlinks into a pnpm
+    # store. If this worktree was reused from an earlier materialization
+    # whose base checkout has since been removed, those per-package links
+    # can be dangling even though the containing node_modules dir looks
+    # fine at a glance. Detect that and force a relink.
+    if find "$target_path" -maxdepth 2 -xtype l -print -quit 2>/dev/null | grep -q .; then
+      needs_install=1
+      break
+    fi
   done < <(list_base_node_modules_paths)
 
   if [[ "$needs_install" -eq 1 ]]; then
