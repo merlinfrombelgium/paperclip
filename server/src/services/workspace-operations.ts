@@ -3,8 +3,10 @@ import type { Db } from "@paperclipai/db";
 import { workspaceOperations } from "@paperclipai/db";
 import type { WorkspaceOperation, WorkspaceOperationPhase, WorkspaceOperationStatus } from "@paperclipai/shared";
 import { asc, desc, eq, inArray, isNull, or, and } from "drizzle-orm";
+import { withTransientDbConflictRetry } from "../db-retry.js";
 import { notFound } from "../errors.js";
 import { redactCurrentUserText, redactCurrentUserValue } from "../log-redaction.js";
+import { logger } from "../middleware/logger.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { getWorkspaceOperationLogStore } from "./workspace-operation-log-store.js";
 
@@ -50,6 +52,30 @@ function combineMetadata(
     ...(base ?? {}),
     ...(patch ?? {}),
   };
+}
+
+/**
+ * `workspace_operations` rows reference `issues.id`, so every insert here takes a
+ * FOR KEY SHARE lock on the issue row that a concurrent `PATCH /api/issues/{id}`
+ * wants to UPDATE. That pair deadlocks, and Postgres picks a victim — historically
+ * the heartbeat, which then lost the whole run on a finalize write.
+ *
+ * Retrying is safe for every write in this module: the insert carries a
+ * client-generated id and the updates are keyed by primary key, and a deadlock
+ * abort rolls the statement back completely, so a replay is not a double-write.
+ */
+function withWorkspaceOperationWriteRetry<T>(
+  context: { operationId: string; phase: string; statement: string },
+  write: () => Promise<T>,
+): Promise<T> {
+  return withTransientDbConflictRetry(write, {
+    onRetry: ({ attempt, delayMs, error }) => {
+      logger.warn(
+        { err: error, ...context, attempt, delayMs },
+        "workspace_operations write hit a transient conflict; retrying",
+      );
+    },
+  });
 }
 
 export interface WorkspaceOperationRecorder {
@@ -99,13 +125,17 @@ export function workspaceOperationService(db: Db) {
         async attachExecutionWorkspaceId(nextExecutionWorkspaceId) {
           executionWorkspaceId = nextExecutionWorkspaceId ?? null;
           if (!executionWorkspaceId || createdIds.length === 0) return;
-          await db
-            .update(workspaceOperations)
-            .set({
-              executionWorkspaceId,
-              updatedAt: new Date(),
-            })
-            .where(inArray(workspaceOperations.id, createdIds));
+          await withWorkspaceOperationWriteRetry(
+            { operationId: createdIds.join(","), phase: "attach", statement: "update:attach" },
+            () =>
+              db
+                .update(workspaceOperations)
+                .set({
+                  executionWorkspaceId,
+                  updatedAt: new Date(),
+                })
+                .where(inArray(workspaceOperations.id, createdIds)),
+          );
         },
 
         async recordOperation(recordInput) {
@@ -133,24 +163,28 @@ export function workspaceOperationService(db: Db) {
             });
           };
 
-          await db.insert(workspaceOperations).values({
-            id,
-            companyId: input.companyId,
-            executionWorkspaceId,
-            heartbeatRunId: input.heartbeatRunId ?? null,
-            issueId: input.issueId ?? null,
-            phase: recordInput.phase,
-            command: recordInput.command ?? null,
-            cwd: recordInput.cwd ?? null,
-            status: "running",
-            logStore: handle.store,
-            logRef: handle.logRef,
-            metadata: redactCurrentUserValue(
-              recordInput.metadata ?? null,
-              currentUserRedactionOptions,
-            ) as Record<string, unknown> | null,
-            startedAt,
-          });
+          await withWorkspaceOperationWriteRetry(
+            { operationId: id, phase: recordInput.phase, statement: "insert" },
+            () =>
+              db.insert(workspaceOperations).values({
+                id,
+                companyId: input.companyId,
+                executionWorkspaceId,
+                heartbeatRunId: input.heartbeatRunId ?? null,
+                issueId: input.issueId ?? null,
+                phase: recordInput.phase,
+                command: recordInput.command ?? null,
+                cwd: recordInput.cwd ?? null,
+                status: "running",
+                logStore: handle.store,
+                logRef: handle.logRef,
+                metadata: redactCurrentUserValue(
+                  recordInput.metadata ?? null,
+                  currentUserRedactionOptions,
+                ) as Record<string, unknown> | null,
+                startedAt,
+              }),
+          );
           createdIds.push(id);
 
           try {
@@ -160,47 +194,55 @@ export function workspaceOperationService(db: Db) {
             await append("stderr", result.stderr ?? null);
             const finalized = await logStore.finalize(handle);
             const finishedAt = new Date();
-            const row = await db
-              .update(workspaceOperations)
-              .set({
-                executionWorkspaceId,
-                status: result.status ?? "succeeded",
-                exitCode: result.exitCode ?? null,
-                stdoutExcerpt: stdoutExcerpt || null,
-                stderrExcerpt: stderrExcerpt || null,
-                logBytes: finalized.bytes,
-                logSha256: finalized.sha256,
-                logCompressed: finalized.compressed,
-                metadata: redactCurrentUserValue(
-                  combineMetadata(recordInput.metadata, result.metadata),
-                  currentUserRedactionOptions,
-                ) as Record<string, unknown> | null,
-                finishedAt,
-                updatedAt: finishedAt,
-              })
-              .where(eq(workspaceOperations.id, id))
-              .returning()
-              .then((rows) => rows[0] ?? null);
+            const row = await withWorkspaceOperationWriteRetry(
+              { operationId: id, phase: recordInput.phase, statement: "update:finish" },
+              () =>
+                db
+                  .update(workspaceOperations)
+                  .set({
+                    executionWorkspaceId,
+                    status: result.status ?? "succeeded",
+                    exitCode: result.exitCode ?? null,
+                    stdoutExcerpt: stdoutExcerpt || null,
+                    stderrExcerpt: stderrExcerpt || null,
+                    logBytes: finalized.bytes,
+                    logSha256: finalized.sha256,
+                    logCompressed: finalized.compressed,
+                    metadata: redactCurrentUserValue(
+                      combineMetadata(recordInput.metadata, result.metadata),
+                      currentUserRedactionOptions,
+                    ) as Record<string, unknown> | null,
+                    finishedAt,
+                    updatedAt: finishedAt,
+                  })
+                  .where(eq(workspaceOperations.id, id))
+                  .returning()
+                  .then((rows) => rows[0] ?? null),
+            );
             if (!row) throw notFound("Workspace operation not found");
             return toWorkspaceOperation(row);
           } catch (error) {
             await append("stderr", error instanceof Error ? error.message : String(error));
             const finalized = await logStore.finalize(handle).catch(() => null);
             const finishedAt = new Date();
-            await db
-              .update(workspaceOperations)
-              .set({
-                executionWorkspaceId,
-                status: "failed",
-                stdoutExcerpt: stdoutExcerpt || null,
-                stderrExcerpt: stderrExcerpt || null,
-                logBytes: finalized?.bytes ?? null,
-                logSha256: finalized?.sha256 ?? null,
-                logCompressed: finalized?.compressed ?? false,
-                finishedAt,
-                updatedAt: finishedAt,
-              })
-              .where(eq(workspaceOperations.id, id));
+            await withWorkspaceOperationWriteRetry(
+              { operationId: id, phase: recordInput.phase, statement: "update:fail" },
+              () =>
+                db
+                  .update(workspaceOperations)
+                  .set({
+                    executionWorkspaceId,
+                    status: "failed",
+                    stdoutExcerpt: stdoutExcerpt || null,
+                    stderrExcerpt: stderrExcerpt || null,
+                    logBytes: finalized?.bytes ?? null,
+                    logSha256: finalized?.sha256 ?? null,
+                    logCompressed: finalized?.compressed ?? false,
+                    finishedAt,
+                    updatedAt: finishedAt,
+                  })
+                  .where(eq(workspaceOperations.id, id)),
+            );
             throw error;
           }
         },
