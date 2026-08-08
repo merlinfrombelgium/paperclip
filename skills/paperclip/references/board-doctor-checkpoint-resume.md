@@ -118,10 +118,12 @@ cat > "$PAPERCLIP_RUN_SCRATCH_DIR/items.json" <<'JSON'
 ]
 JSON
 
-# 2. Persist it before touching anything.
+# 2. Persist it before touching anything. --population is how many cards you scanned to
+#    produce the worklist; it turns on the detector-fault guard (see below).
 python3 skills/paperclip/scripts/board_doctor_sweep.py \
   --source-issue "$PAPERCLIP_TASK_ID" \
-  plan "$PAPERCLIP_RUN_SCRATCH_DIR/items.json" --sweep-id "sweep-$(date -u +%Y-%m-%d)"
+  plan "$PAPERCLIP_RUN_SCRATCH_DIR/items.json" --sweep-id "sweep-$(date -u +%Y-%m-%d)" \
+  --population 183
 
 # 3. Apply within budget. Re-run each heartbeat until it prints "complete".
 python3 skills/paperclip/scripts/board_doctor_sweep.py --source-issue "$PAPERCLIP_TASK_ID" apply
@@ -139,6 +141,82 @@ same board condition produces the same key and cannot double-apply.
 An unfinished sweep is the **expected steady state**, not a failure. `apply` exits 0 while
 converging. Report progress as `N/M items, K remaining` and keep the issue on a live
 continuation path until the worklist is empty.
+
+## Scanning the board: one request is not the board
+
+Measured live 2026-08-08 (ZIM-2072) against `GET /api/companies/{id}/issues`:
+
+| | |
+| - | - |
+| `limit` | capped at **1000** server-side. `?limit=3000` returns 1000 rows and says nothing about the truncation — no count, no header, no envelope flag. |
+| `offset` | works; pages are disjoint. |
+| `cursor` | **silently ignored**. `?limit=500&cursor=500` returns page 1 again, with a 200. |
+
+On the board that day, one max-limit request saw **1000 of 2131** issues and **110 of 183**
+`blocked` cards. A planner that scans once is reasoning about 60% of its population and has
+no way to tell from the response. This is the likeliest reason two consecutive scans of the
+"same" bucket disagree — check your paging before concluding the board drifted.
+
+Use `PaperclipClient.list_issues(company_id)`, which walks `offset` until a short page,
+dedupes by id, and raises rather than returning a knowingly truncated board.
+
+Rows come back newest-touched first, so a card updated mid-walk can move to an earlier page
+and be **skipped** by the walk. Dedupe handles duplicates; nothing handles skips. That is
+why the sweep re-plans from a fresh scan every heartbeat, and why "absent from the worklist"
+never means "nothing to repair here".
+
+## The detector-fault guard
+
+Every other check in this engine validates the *mechanics* of a write. Verify-before-write
+asks "has this repair already landed?" — never "should this repair happen at all". A
+worklist built from a predicate that is simply wrong passes every one of them and lands
+every write.
+
+The near-miss that motivated the guard (ZIM-2072, 2026-08-07): the blocker set is written as
+`blockedByIssueIds` and read as `blockedBy`. Reading the write key returns `None` for every
+issue, which looks exactly like "no blockers anywhere" — so a zombie-blocker planner scored
+**73 of 73** blocked cards as repairable and would have swept 146 cap units across live,
+correctly-blocked work. The items were well-formed, individually verifiable, and correctly
+budgeted. Only the diagnosis was wrong. (The useful signal is
+`blockerAttention.unresolvedBlockerCount`; there is no `/blockers`, `/relations` or
+`/dependencies` endpoint — all 404.)
+
+So `plan(..., population=N)` refuses a worklist whose **distinct targets** exceed half the
+scanned population, once there are at least 5 of them. Real drift on a tended board is a
+minority of any bucket; a predicate matching most of what it scanned is far more likely to
+be reading the wrong field. Ordered pairs count once — 20 `unblock_and_close` pairs are 20
+targets, not 40 items.
+
+The threshold is a heuristic, and it is meant to be argued with: `--force` overrides it, and
+`--max-target-fraction` moves it. What it buys is that a mass sweep against a whole bucket
+has to be a decision someone made, not a default someone got.
+
+### Cool-off: fresh state is somebody else's decision
+
+The fraction guard does not catch the other way a well-formed worklist is wrong — the state
+it calls stale was set on purpose, this morning, by another agent.
+
+Observed 2026-08-08 (ZIM-2072): a scan found **58** `blocked` cards with no blocker edge —
+116 cap units, comfortably over budget, and only **32%** of the bucket, so the fraction
+guard admits it. About **40 of them had been moved to `blocked` that same morning** by
+another agent's ZIM-2112 aging-rule sweep, each carrying a deliberate board-gated wait.
+Sweeping them would have reverted an hours-old decision at scale and raced an agent still
+working the bucket.
+
+So run the scan output through `apply_cooloff()` before building work items:
+
+```python
+sweepable, too_fresh = apply_cooloff(candidates)          # default 24h
+log(f"{len(too_fresh)} candidates withheld as touched within 24h")
+```
+
+Drift worth repairing is old. A cool-off costs a heartbeat or two of latency on genuine
+drift and buys immunity to every concurrent writer on the board. A card whose timestamp
+cannot be parsed counts as too fresh — the safe reading of "I cannot tell how old this is"
+is "do not mass-write it".
+
+`apply_cooloff` returns **both** halves. Report what was withheld: a guard that silently
+shrinks a worklist reads exactly like a board that had nothing wrong with it.
 
 ## What a write costs
 

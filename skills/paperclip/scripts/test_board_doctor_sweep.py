@@ -17,6 +17,7 @@ import os
 import sys
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -26,10 +27,13 @@ from board_doctor_sweep import (  # noqa: E402
     MAX_ATTEMPTS,
     PENDING,
     SKIPPED,
+    PaperclipClient,
     SweepState,
     Sweeper,
     WorkItem,
     WriteRefused,
+    apply_cooloff,
+    detector_fault,
     unblock_and_close,
 )
 
@@ -751,6 +755,194 @@ class OrderedPairTests(unittest.TestCase):
         self.assertEqual(len(patched), total * 2, "exactly two writes per target")
         for i in range(1, total + 1):
             self.assertEqual(board.issues[f"issue-{i}"]["status"], "done")
+
+
+class CooloffTests(unittest.TestCase):
+    """Fresh state is somebody else's decision, not drift.
+
+    Observed on ZIM-2072 (2026-08-08): a scan found 58 `blocked` cards with no blocker
+    edge -- 116 cap units, >budget, and only 32% of the bucket, so the fraction guard
+    admits it. About 40 had been set `blocked` that same morning by another agent's
+    ZIM-2112 aging-rule sweep, each with a deliberate board-gated wait.
+    """
+
+    NOW = datetime(2026, 8, 8, 12, 0, tzinfo=timezone.utc)
+
+    @staticmethod
+    def _card(ident, updated):
+        return {"id": f"issue-{ident}", "identifier": ident, "updatedAt": updated}
+
+    def test_this_mornings_sweep_is_withheld_and_old_drift_is_not(self):
+        scanned = [
+            self._card("ZIM-363", "2026-08-08T08:35:07.306Z"),   # ZIM-2112 sweep, 3h old
+            self._card("ZIM-921", "2026-08-08T08:35:07.891Z"),   # same
+            self._card("ZIM-291", "2026-07-23T11:16:43.951Z"),   # genuinely stale
+        ]
+        sweepable, too_fresh = apply_cooloff(scanned, now=self.NOW)
+
+        self.assertEqual([i["identifier"] for i in sweepable], ["ZIM-291"])
+        self.assertEqual(len(too_fresh), 2)
+
+    def test_both_halves_are_returned_so_nothing_is_silently_dropped(self):
+        scanned = [self._card(f"ZIM-{n}", "2026-08-08T08:00:00.000Z") for n in range(40)]
+        sweepable, too_fresh = apply_cooloff(scanned, now=self.NOW)
+
+        self.assertEqual(sweepable, [])
+        self.assertEqual(len(too_fresh), 40, "a withheld worklist must still be reportable")
+
+    def test_an_unreadable_timestamp_is_treated_as_too_fresh(self):
+        scanned = [
+            self._card("ZIM-1", None),
+            self._card("ZIM-2", "not-a-date"),
+            {"id": "issue-3", "identifier": "ZIM-3"},
+        ]
+        sweepable, too_fresh = apply_cooloff(scanned, now=self.NOW)
+
+        self.assertEqual(sweepable, [], "cannot date it => do not mass-write it")
+        self.assertEqual(len(too_fresh), 3)
+
+    def test_the_window_is_tunable(self):
+        scanned = [self._card("ZIM-363", "2026-08-08T08:35:00.000Z")]  # 3h25m old
+
+        self.assertEqual(apply_cooloff(scanned, min_age_hours=1, now=self.NOW)[0], scanned)
+        self.assertEqual(apply_cooloff(scanned, min_age_hours=6, now=self.NOW)[0], [])
+
+    def test_boundary_is_inclusive_of_exactly_aged_cards(self):
+        scanned = [self._card("ZIM-1", "2026-08-07T12:00:00.000Z")]  # exactly 24h
+        self.assertEqual(len(apply_cooloff(scanned, now=self.NOW)[0]), 1)
+
+
+class EnumerationTests(unittest.TestCase):
+    """The population a sweep plans against has to be the whole board, not page one.
+
+    Measured live on 2026-08-08 (ZIM-2072): the company issue list caps `limit` at 1000
+    server-side and reports nothing when it truncates, so one max-limit request saw 1000
+    of 2131 issues and 110 of 183 `blocked` cards. `cursor` is silently ignored; `offset`
+    is what actually pages.
+    """
+
+    class StubClient(PaperclipClient):
+        """Client whose transport is a paged in-memory board with a hard limit cap."""
+
+        def __init__(self, rows, server_limit_cap=1000):
+            super().__init__("http://example.invalid", "key")
+            self.rows = rows
+            self.server_limit_cap = server_limit_cap
+            self.requests = []
+
+        def _request(self, method, path, body=None):
+            self.requests.append(path)
+            query = dict(p.split("=", 1) for p in path.split("?", 1)[1].split("&"))
+            limit = min(int(query["limit"]), self.server_limit_cap)
+            offset = int(query.get("offset", 0))
+            return self.rows[offset:offset + limit]
+
+    @staticmethod
+    def _rows(n, start=1):
+        return [{"id": f"issue-{start + i}", "identifier": f"ZIM-{start + i}"} for i in range(n)]
+
+    def test_walks_offset_pages_until_a_short_page(self):
+        client = self.StubClient(self._rows(1250))
+        got = client.list_issues("company", page_size=500)
+
+        self.assertEqual(len(got), 1250)
+        self.assertEqual(len(client.requests), 3)
+        self.assertIn("offset=1000", client.requests[-1])
+
+    def test_single_request_under_samples_and_cannot_tell(self):
+        """Negative control for the whole method: one big request is silently partial."""
+        client = self.StubClient(self._rows(2131), server_limit_cap=1000)
+
+        single = client._request("GET", "/api/companies/company/issues?limit=3000")
+        self.assertEqual(len(single), 1000, "server truncates without saying so")
+
+        walked = client.list_issues("company", page_size=500)
+        self.assertEqual(len(walked), 2131)
+        self.assertGreater(len(walked), len(single))
+
+    def test_rows_seen_on_two_pages_are_counted_once(self):
+        """A card touched mid-walk shifts across the page boundary and repeats."""
+        rows = self._rows(6)
+        client = self.StubClient(rows[:4] + rows[3:])  # issue-4 appears on both pages
+        got = client.list_issues("company", page_size=4)
+
+        self.assertEqual(len({r["id"] for r in got}), len(got), "no duplicate targets")
+        self.assertEqual(len(got), 6)
+
+    def test_a_walk_that_never_terminates_is_refused_not_truncated(self):
+        client = self.StubClient(self._rows(5000))
+        with self.assertRaises(WriteRefused) as caught:
+            client.list_issues("company", page_size=500, max_pages=3)
+        self.assertIn("truncated", str(caught.exception))
+
+    def test_envelope_and_bare_list_shapes_both_parse(self):
+        class Enveloped(EnumerationTests.StubClient):
+            def _request(self, method, path, body=None):
+                return {"issues": super()._request(method, path, body)}
+
+        self.assertEqual(len(Enveloped(self._rows(3)).list_issues("company", page_size=500)), 3)
+
+
+class DetectorFaultGuardTests(unittest.TestCase):
+    """The guard that questions the diagnosis rather than the mechanics of a write.
+
+    The near-miss it encodes (ZIM-2072, 2026-08-07): the blocker set is written as
+    `blockedByIssueIds` and read as `blockedBy`, so a planner reading the write key scored
+    73 of 73 blocked cards as zombie-blocked and would have swept 146 units across live,
+    correctly-blocked work. Every other check in the engine passes that worklist.
+    """
+
+    def test_a_worklist_covering_most_of_its_population_is_refused(self):
+        board = make_board(73, cap=20)
+        sweeper = Sweeper(board, "source")
+
+        with self.assertRaises(ValueError) as caught:
+            sweeper.plan("s1", make_items(73), cap=20, reserve=1, population=73)
+
+        self.assertIn("73 of 73", str(caught.exception))
+        self.assertIsNone(sweeper.load(), "a refused plan must persist nothing")
+        self.assertEqual(board.write_log, [], "and must not touch a single target")
+
+    def test_the_same_worklist_plans_fine_without_the_guard(self):
+        """Negative control: the guard, not something else, is what stops the near-miss."""
+        sweeper = Sweeper(make_board(73, cap=20), "source")
+        state = sweeper.plan("s1", make_items(73), cap=20, reserve=1)  # no population
+        self.assertEqual(len(state.items), 73)
+
+    def test_a_minority_bucket_is_admitted(self):
+        """11 of 73 is what the corrected detector actually reported."""
+        sweeper = Sweeper(make_board(11, cap=20), "source")
+        state = sweeper.plan("s1", make_items(11), cap=20, reserve=1, population=73)
+
+        self.assertEqual(len(state.items), 11)
+        self.assertEqual(state.population, 73)
+
+    def test_small_worklists_are_exempt_from_the_fraction_test(self):
+        """4 of 4 is an ordinary targeted repair, not a mass sweep."""
+        sweeper = Sweeper(make_board(4, cap=20), "source")
+        self.assertEqual(len(sweeper.plan("s1", make_items(4), population=4).items), 4)
+
+    def test_ordered_pairs_count_targets_not_items(self):
+        """Two writes against one card is one target; the guard must not double-count."""
+        items = []
+        for i in range(1, 21):
+            items += unblock_and_close(f"issue-{i}", f"ZIM-{i}", f"ZIM-{i}")
+        self.assertEqual(len(items), 40)
+        self.assertIsNone(detector_fault(items, population=60), "20 targets of 60, not 40")
+        self.assertIsNotNone(detector_fault(items, population=30))
+
+    def test_force_overrides_a_deliberate_mass_sweep(self):
+        sweeper = Sweeper(make_board(73, cap=20), "source")
+        state = sweeper.plan("s1", make_items(73), cap=20, reserve=1,
+                             population=73, force=True)
+        self.assertEqual(len(state.items), 73)
+
+    def test_the_document_records_the_denominator(self):
+        sweeper = Sweeper(make_board(11, cap=20), "source")
+        state = sweeper.plan("s1", make_items(11), cap=20, reserve=1, population=73)
+
+        self.assertIn("11 of 73 scanned", state.to_document())
+        self.assertEqual(SweepState.from_document(state.to_document()).population, 73)
 
 
 if __name__ == "__main__":

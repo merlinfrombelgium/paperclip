@@ -87,6 +87,44 @@ BLOCKER_FIELD = "blockedByIssueIds"
 # heartbeats it is parked as failed_permanent and surfaced for board action.
 MAX_ATTEMPTS = 3
 
+# Enumerating the board is the first thing a mass-repair planner gets wrong, and it fails
+# silently. Verified live against the shipped API (2026-08-08, ZIM-2072):
+#   * `limit` is capped server-side at 1000. `?limit=3000` returns exactly 1000 rows with
+#     no field, header or envelope saying anything was withheld.
+#   * `offset` works and pages are disjoint. `cursor` is silently ignored -- `?cursor=500`
+#     returns page 1 again, with a 200.
+#   * On the board at the time: one max-limit request saw 1000 of 2131 issues, and 110 of
+#     183 `blocked` cards. A planner that scans once sees 60% of the population it is
+#     reasoning about and has no way to tell from the response.
+# Rows are returned newest-touched first, so a target updated mid-walk can move to an
+# earlier page and be skipped by the walk entirely. Dedupe fixes duplicates; nothing fixes
+# skips. That is why the sweep re-plans from a fresh scan every heartbeat and why
+# "absent from the worklist" never means "nothing to repair here".
+LIST_PAGE_SIZE = 500
+LIST_MAX_PAGES = 40
+
+# A repair predicate that matches most of the population it was run over is a broken
+# detector, not a backlog. Observed on ZIM-2072 (2026-08-07): reading the *write* key
+# ``blockedByIssueIds`` returns None for every issue -- the read key is ``blockedBy`` --
+# so a zombie-blocker planner scored 73 of 73 blocked cards as repairable and would have
+# planned a 146-unit sweep of live, correctly-blocked work. Every other safety mechanism
+# here would have let it through: the items were well-formed, individually verifiable and
+# properly budgeted. Only their diagnosis was wrong.
+DEFAULT_MAX_TARGET_FRACTION = 0.5
+GUARD_MIN_TARGETS = 5
+
+# The other way a well-formed worklist is wrong: the state it calls stale was set on
+# purpose, minutes ago, by somebody else. Observed on ZIM-2072 (2026-08-08): a scan found
+# 58 blocked cards with no blocker edge -- 116 cap units, comfortably >budget and only 32%
+# of the bucket, so the fraction guard admits it. Roughly 40 of them had been moved to
+# `blocked` that same morning by another agent's ZIM-2112 aging-rule sweep, each with a
+# deliberate board-gated wait. Sweeping them would have reverted a hours-old decision at
+# scale, and raced the agent still working the bucket.
+#
+# Drift worth repairing is old. A cool-off costs a heartbeat or two of latency on genuine
+# drift and buys immunity to every concurrent writer on the board.
+DEFAULT_COOLOFF_HOURS = 24
+
 PENDING = "pending"
 DONE = "done"
 SKIPPED = "skipped"
@@ -182,6 +220,70 @@ def payload_defect(op: str, payload: dict[str, Any]) -> Optional[str]:
     return None
 
 
+def detector_fault(items: Iterable["WorkItem"], population: Optional[int],
+                   max_fraction: float = DEFAULT_MAX_TARGET_FRACTION,
+                   min_targets: int = GUARD_MIN_TARGETS) -> Optional[str]:
+    """Describe why a worklist looks like a broken predicate, or None if it looks sane.
+
+    Verify-before-write cannot catch this class of error. It asks "has this repair already
+    landed?", never "should this repair happen at all" -- so a worklist built from a
+    predicate that is simply wrong passes every check and lands every write.
+
+    The population-fraction heuristic is the cheapest available proxy: real drift on a
+    tended board is a minority of any bucket, so a predicate claiming most of what it
+    scanned is far more likely to be reading the wrong field than to have found that the
+    board is mostly broken. Pass ``population=None`` to opt out (and lose the guard).
+    """
+    targets = {i.target_issue_id for i in items}
+    if population is None or population <= 0 or len(targets) < min_targets:
+        return None
+    fraction = len(targets) / population
+    if fraction <= max_fraction:
+        return None
+    return (
+        f"worklist covers {len(targets)} of {population} scanned cards "
+        f"({fraction:.0%} > {max_fraction:.0%} threshold). A predicate that matches most "
+        "of its population is far more likely to be reading the wrong field than to have "
+        "found a board that is mostly broken -- re-check the detector against a handful "
+        "of targets by hand before sweeping. Pass force=True to override."
+    )
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def apply_cooloff(candidates: Iterable[dict[str, Any]],
+                  min_age_hours: float = DEFAULT_COOLOFF_HOURS,
+                  now: Optional[datetime] = None,
+                  field_name: str = "updatedAt") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split scanned candidates into ``(sweepable, too_fresh)`` by last-touched age.
+
+    Call this on the scan output *before* building work items. A card someone else wrote
+    minutes ago is not drift -- it is a decision, or an agent mid-sweep -- and repairing it
+    races a live writer. Candidates with no parseable timestamp are treated as too fresh:
+    the safe reading of "I cannot tell how old this is" is "do not mass-write it".
+
+    Returns both halves on purpose. Report what was withheld; a guard that silently shrinks
+    a worklist reads exactly like a board that had nothing wrong with it.
+    """
+    now = now or datetime.now(timezone.utc)
+    sweepable: list[dict[str, Any]] = []
+    too_fresh: list[dict[str, Any]] = []
+    for issue in candidates:
+        touched = _parse_ts(issue.get(field_name))
+        if touched is None or (now - touched).total_seconds() < min_age_hours * 3600:
+            too_fresh.append(issue)
+        else:
+            sweepable.append(issue)
+    return sweepable, too_fresh
+
+
 def unblock_and_close(target_issue_id: str, target_identifier: str, key_prefix: str,
                       status: str = "done") -> list[WorkItem]:
     """The canonical zombie-blocker repair, as the two ordered writes it actually is.
@@ -227,6 +329,9 @@ class SweepState:
     updated_at: str = field(default_factory=_utcnow)
     heartbeats: int = 0
     completed_at: Optional[str] = None
+    # How many cards the planner scanned to produce this worklist. Recorded so a reader of
+    # the document can see the denominator the detector-fault guard was checked against.
+    population: Optional[int] = None
 
     # -- budget ------------------------------------------------------------------
 
@@ -317,6 +422,12 @@ class SweepState:
             f"- Per-heartbeat write budget: {self.budget} (cap {self.cap}, reserve {self.reserve})",
             f"- Updated: {self.updated_at}",
         ]
+        if self.population:
+            targets = len({i.target_issue_id for i in self.items})
+            lines.append(
+                f"- Targets: {targets} of {self.population} scanned "
+                f"({targets / self.population:.0%} of population)"
+            )
         if self.completed_at:
             lines.append(f"- Completed: {self.completed_at}")
         lines += ["", "| # | Target | Op | State | Attempts | Note |", "| - | - | - | - | - | - |"]
@@ -407,6 +518,34 @@ class PaperclipClient:
 
     def get_issue(self, issue_id: str) -> dict[str, Any]:
         return self._request("GET", f"/api/issues/{issue_id}")
+
+    def list_issues(self, company_id: str, page_size: int = LIST_PAGE_SIZE,
+                    max_pages: int = LIST_MAX_PAGES) -> list[dict[str, Any]]:
+        """Every issue on the board, walked with ``offset`` until a short page.
+
+        Never raise the page size to "just get them all" -- the server caps ``limit`` at
+        1000 and says nothing when it truncates, so a single big request quietly returns a
+        partial board that a planner then treats as the whole population. See the
+        LIST_PAGE_SIZE notes above for the measured shortfall.
+        """
+        out: dict[str, dict[str, Any]] = {}
+        for page in range(max_pages):
+            offset = page * page_size
+            raw = self._request(
+                "GET",
+                f"/api/companies/{company_id}/issues?limit={page_size}&offset={offset}",
+            )
+            rows = raw.get("issues", []) if isinstance(raw, dict) else (raw or [])
+            for row in rows:
+                key = row.get("id") or row.get("identifier")
+                if key:
+                    out[key] = row
+            if len(rows) < page_size:
+                return list(out.values())
+        raise WriteRefused(
+            f"issue list did not terminate within {max_pages} pages of {page_size}; "
+            "refusing to plan against a population that is known to be truncated"
+        )
 
     def get_document(self, issue_id: str, key: str) -> Optional[dict[str, Any]]:
         try:
@@ -545,12 +684,18 @@ class Sweeper:
             self._base_revision_id = doc.get("latestRevisionId") or self._base_revision_id
 
     def plan(self, sweep_id: str, items: Iterable[WorkItem], cap: int = DEFAULT_CAP,
-             reserve: int = DEFAULT_RESERVE, force: bool = False) -> SweepState:
+             reserve: int = DEFAULT_RESERVE, force: bool = False,
+             population: Optional[int] = None,
+             max_target_fraction: float = DEFAULT_MAX_TARGET_FRACTION) -> SweepState:
         """Persist a new worklist. Refuses to clobber a sweep still in progress.
 
         The whole worklist is written *before* any repair, so a run that dies immediately
         after planning still leaves a complete resume point rather than a half-repaired
         board with no record of what was intended.
+
+        ``population`` is how many cards the planner scanned to build ``items``; passing it
+        turns on the detector-fault guard, which is the only check here that questions the
+        diagnosis rather than the mechanics of a write.
         """
         existing = self.load()
         if existing and not existing.complete and not force:
@@ -564,7 +709,12 @@ class Sweeper:
             items=list(items),
             cap=cap,
             reserve=reserve,
+            population=population,
         )
+        if not force:
+            fault = detector_fault(state.items, population, max_target_fraction)
+            if fault:
+                raise ValueError(f"sweep {sweep_id} refused: {fault}")
         # Reject writes the platform is known to refuse at plan time rather than
         # discovering it at the boundary, where it costs an attempt and a round trip.
         for item in state.items:
@@ -764,6 +914,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_plan.add_argument("--cap", type=int, default=DEFAULT_CAP)
     p_plan.add_argument("--reserve", type=int, default=DEFAULT_RESERVE)
     p_plan.add_argument("--force", action="store_true")
+    p_plan.add_argument("--population", type=int, default=None,
+                        help="cards scanned to build this worklist; enables the "
+                             "detector-fault guard")
+    p_plan.add_argument("--max-target-fraction", type=float,
+                        default=DEFAULT_MAX_TARGET_FRACTION)
 
     sub.add_parser("apply", help="apply/resume the persisted worklist within budget")
     sub.add_parser("status", help="print the current resume point")
@@ -778,7 +933,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if args.cmd == "plan":
         state = sweeper.plan(args.sweep_id, _items_from_file(args.items_file),
-                             cap=args.cap, reserve=args.reserve, force=args.force)
+                             cap=args.cap, reserve=args.reserve, force=args.force,
+                             population=args.population,
+                             max_target_fraction=args.max_target_fraction)
         print(f"planned {len(state.items)} items for sweep {state.sweep_id} "
               f"(budget {state.budget}/heartbeat)")
         return 0
