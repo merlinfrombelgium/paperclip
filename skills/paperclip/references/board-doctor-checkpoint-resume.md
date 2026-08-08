@@ -174,6 +174,46 @@ writes outside the engine can.
 An item that costs more than a whole heartbeat's budget is parked as `failed_permanent`
 rather than re-tripping the gate forever.
 
+## Ordered pairs: unblock-and-close is two writes, not one
+
+Observed live on ZIM-1880 (2026-08-07). This is refused:
+
+```
+PATCH {blockedByIssueIds: [], status: "done"}
+  409 Issue follow-up blocked by unresolved blockers
+  details.unresolvedBlockerIssueIds: ["db3df841-..."]
+```
+
+The status transition is validated against the blocker set **as it stood before the
+request**, not the set in the same body. Clearing and closing must be two ordered PATCHes.
+
+This matters more than it looks, because unblock-and-close is the *commonest* repair the
+sweep performs. Planned as one item it is costed at 1 and would 409 anyway; a 10-target
+zombie pass budgeted at 10 units really wants 20 writes. Use the helper:
+
+```python
+from board_doctor_sweep import unblock_and_close
+items = unblock_and_close(issue_id, "ZIM-1880", key_prefix="ZIM-1880:zombie")  # 2 items
+```
+
+Three mechanisms back it, each with a negative-control test proving it is load-bearing:
+
+- **`payload_defect`** rejects a combined blocker-clear + status PATCH at *plan* time, so
+  the sweep never spends an attempt discovering the 409 at the boundary.
+- **`WorkItem.depends_on`** stops the close from being attempted before the unblock has
+  actually landed, and parks it immediately if the unblock parks — rather than burning
+  three doomed attempts on a write that cannot succeed.
+- **Chain admission** charges the budget gate for the item *plus everything still waiting
+  on it* (`SweepState.chain_cost`). A pair is admitted only if both halves fit in the
+  remaining budget.
+
+That last one is the point. Without it the sweep will happily spend its final unit
+clearing a card's blockers and then stop for budget, leaving the target **blockers cleared
+but still `blocked`** — a half-repaired state persisting until the next heartbeat, which
+is precisely what this engine promises cannot happen. The convergence test asserts the
+"fully repaired or entirely untouched" invariant at *every* intermediate checkpoint, not
+just at the end.
+
 ## The refusal is not observable before 2026-08-11
 
 The shipped code derives `mode = now >= CROSS_ISSUE_INFLUENCE_ENFORCE_AT ? "enforce" :

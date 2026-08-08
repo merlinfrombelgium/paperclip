@@ -30,6 +30,7 @@ from board_doctor_sweep import (  # noqa: E402
     Sweeper,
     WorkItem,
     WriteRefused,
+    unblock_and_close,
 )
 
 
@@ -105,6 +106,17 @@ class FakeBoard:
             applied = self._spend(issue_id, "patch")
         if patch.get("comment"):
             applied = self._spend(issue_id, "comment") and applied
+        # Mirrors the refusal observed live on ZIM-1880: the status transition is checked
+        # against the blocker set as it stood *before* this request, so a PATCH that
+        # clears blockers and closes in one go is rejected. Note the cap was already
+        # spent above -- the observation is recorded before this boundary check, so a
+        # refused write still costs budget.
+        current = self.issues.get(issue_id, {})
+        if "status" in fields and current.get("blockedByIssueIds"):
+            raise WriteRefused(
+                'HTTP 409 PATCH: {"error":"Issue follow-up blocked by unresolved blockers",'
+                f'"details":{{"unresolvedBlockerIssueIds":{current["blockedByIssueIds"]}}}}}'
+            )
         if applied and fields:
             self.issues.setdefault(issue_id, {}).update(fields)
         return {"ok": True}
@@ -578,6 +590,167 @@ class PlanningTests(unittest.TestCase):
         _, result = Sweeper(board, "source").run()
         self.assertFalse(result.complete)
         self.assertIn("no persisted worklist", result.errors[0])
+
+
+class OrderedPairTests(unittest.TestCase):
+    """The zombie-blocker repair is two ordered writes, and must be budgeted as such.
+
+    Observed live on ZIM-1880 (2026-08-07): `PATCH {blockedByIssueIds: [], status: "done"}`
+    is refused, because the transition is validated against the blocker set as it stood
+    before the request. Splitting it makes the commonest repair the sweep performs cost
+    two cap units, and introduces an intermediate state -- blockers cleared, status not
+    yet moved -- that must never be left standing at a checkpoint.
+    """
+
+    @staticmethod
+    def _zombie_board(n, cap=20, start=1):
+        issues = {
+            f"issue-{start + i}": {
+                "id": f"issue-{start + i}",
+                "status": "blocked",
+                "blockedByIssueIds": [f"ghost-{start + i}"],
+            }
+            for i in range(n)
+        }
+        issues["source"] = {"id": "source", "status": "in_progress"}
+        return FakeBoard(issues, cap=cap)
+
+    @staticmethod
+    def _pairs(n, start=1):
+        items = []
+        for i in range(n):
+            items += unblock_and_close(
+                f"issue-{start + i}", f"ZIM-{start + i}", f"ZIM-{start + i}:zombie"
+            )
+        return items
+
+    def test_the_combined_patch_really_is_refused(self):
+        """The guard is not hypothetical: the one-shot repair fails against the board."""
+        board = self._zombie_board(1)
+        with self.assertRaises(WriteRefused) as caught:
+            board.patch_issue("issue-1", {"blockedByIssueIds": [], "status": "done"})
+        self.assertIn("unresolved blockers", str(caught.exception))
+        self.assertEqual(board.issues["issue-1"]["status"], "blocked")
+
+    def test_plan_rejects_the_combined_patch(self):
+        board = self._zombie_board(1)
+        sweeper = Sweeper(board, "source")
+        bad = WorkItem(key="k", target_issue_id="issue-1", target_identifier="ZIM-1",
+                       op="patch_issue", payload={"blockedByIssueIds": [], "status": "done"})
+
+        with self.assertRaises(ValueError) as caught:
+            sweeper.plan("s1", [bad], cap=20, reserve=1)
+        self.assertIn("unblock_and_close", str(caught.exception))
+        self.assertEqual(board.writes, 0, "a defective plan must cost no writes")
+
+    def test_plan_rejects_a_dangling_dependency(self):
+        board = self._zombie_board(1)
+        orphan = WorkItem(key="k", target_issue_id="issue-1", target_identifier="ZIM-1",
+                          op="patch_issue", payload={"status": "done"}, depends_on="nobody")
+        with self.assertRaises(ValueError) as caught:
+            Sweeper(board, "source").plan("s1", [orphan], cap=20, reserve=1)
+        self.assertIn("not in the worklist", str(caught.exception))
+
+    def test_pair_costs_two_units_and_lands_in_order(self):
+        board = self._zombie_board(1)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", self._pairs(1), cap=20, reserve=1)
+
+        state, result = sweeper.run()
+
+        self.assertTrue(result.complete)
+        self.assertEqual(result.writes_used, 2, "unblock + close is a 2-unit repair")
+        self.assertEqual(board.writes, 2)
+        self.assertEqual(board.issues["issue-1"]["status"], "done")
+        self.assertEqual(board.issues["issue-1"]["blockedByIssueIds"], [])
+        self.assertTrue(all(i.state == DONE for i in state.items))
+
+    def test_pair_is_never_split_across_a_budget_boundary(self):
+        """The half-repaired state this whole engine exists to prevent."""
+        # Budget 3: one full pair (2 units) fits, the second pair does not.
+        board = self._zombie_board(2, cap=4)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", self._pairs(2), cap=4, reserve=1)
+
+        state, result = sweeper.run()
+
+        self.assertTrue(result.stopped_for_budget)
+        self.assertEqual(result.writes_used, 2, "must not start a pair it cannot finish")
+        # Every target is either fully repaired or entirely untouched -- never in between.
+        for issue in (board.issues["issue-1"], board.issues["issue-2"]):
+            cleared = issue.get("blockedByIssueIds") == []
+            closed = issue.get("status") == "done"
+            self.assertEqual(cleared, closed, f"half-repaired target: {issue}")
+        # And the checkpoint records the unstarted pair as the resume point.
+        restored = sweeper.load()
+        self.assertEqual(len(restored.pending), 2)
+
+    def test_dependent_is_parked_when_its_prerequisite_parks(self):
+        board = self._zombie_board(1)
+        sweeper = Sweeper(board, "source")
+        state = sweeper.plan("s1", self._pairs(1), cap=20, reserve=1)
+
+        with unittest.mock.patch.object(
+            board, "patch_issue", side_effect=WriteRefused("HTTP 500 boom")
+        ):
+            for _ in range(MAX_ATTEMPTS):
+                state, _ = sweeper.run()
+            state, _ = sweeper.run()
+
+        unblock, close = state.items
+        self.assertEqual(unblock.state, FAILED_PERMANENT)
+        self.assertEqual(close.state, FAILED_PERMANENT)
+        self.assertIn("prerequisite", close.note)
+        self.assertTrue(state.complete, "a dead pair must not wedge the sweep")
+
+    def test_externally_closed_target_costs_no_writes(self):
+        board = self._zombie_board(1)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", self._pairs(1), cap=20, reserve=1)
+        # Somebody else repaired it between planning and applying.
+        board.issues["issue-1"].update({"status": "done", "blockedByIssueIds": []})
+
+        state, result = sweeper.run()
+
+        self.assertEqual(result.skipped, 2)
+        self.assertEqual(board.writes, 0, "both halves verify against the final status")
+        self.assertTrue(state.complete)
+
+    def test_depends_on_survives_the_document_round_trip(self):
+        state = SweepState(sweep_id="s1", source_issue_id="source", items=self._pairs(1))
+        restored = SweepState.from_document(state.to_document())
+        self.assertEqual(restored.items[1].depends_on, restored.items[0].key)
+
+    def test_zombie_sweep_larger_than_the_cap_converges_without_half_repairs(self):
+        total = 15  # 30 cap units against a budget of 19 -- two heartbeats minimum
+        board = self._zombie_board(total, cap=20)
+        sweeper = Sweeper(board, "source")
+        sweeper.plan("s1", self._pairs(total), cap=20, reserve=1)
+
+        heartbeats = 0
+        for _ in range(10):
+            state, result = sweeper.run()
+            heartbeats += 1
+            # Invariant checked at every intermediate checkpoint, not just at the end.
+            for i in range(1, total + 1):
+                issue = board.issues[f"issue-{i}"]
+                self.assertEqual(
+                    issue.get("blockedByIssueIds") == [],
+                    issue.get("status") == "done",
+                    f"half-repaired ZIM-{i} at checkpoint {heartbeats}",
+                )
+            self.assertLessEqual(board.writes, board.cap)
+            board.writes = 0  # new heartbeat, fresh allowance
+            if result.complete:
+                break
+
+        self.assertTrue(result.complete)
+        self.assertGreater(heartbeats, 1, "this sweep must not fit in one heartbeat")
+        self.assertTrue(all(i.state == DONE for i in state.items))
+        patched = [e for e in board.write_log if e[1] == "patch"]
+        self.assertEqual(len(patched), total * 2, "exactly two writes per target")
+        for i in range(1, total + 1):
+            self.assertEqual(board.issues[f"issue-{i}"]["status"], "done")
 
 
 if __name__ == "__main__":

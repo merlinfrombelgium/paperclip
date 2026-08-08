@@ -78,6 +78,11 @@ CAP_ENFORCE_AT = "2026-08-11T00:00:00.000Z"
 COST_UPDATE = 1
 COST_COMMENT = 1
 
+# The blocker set is not a plain field: a status transition is validated against the
+# blocker set as it was *before* the request, so clearing blockers and closing the issue
+# cannot share a PATCH. See ``payload_defect`` and ``unblock_and_close``.
+BLOCKER_FIELD = "blockedByIssueIds"
+
 # A single item that keeps failing must not wedge the sweep forever. After this many
 # heartbeats it is parked as failed_permanent and surfaced for board action.
 MAX_ATTEMPTS = 3
@@ -109,6 +114,11 @@ class WorkItem:
     ``verify`` is a mapping of issue-field -> expected value, evaluated against the live
     target issue. An empty mapping means "cannot be verified by reading the target"; such
     items are written at most once per sweep and rely on ``state`` alone.
+
+    ``depends_on`` names another item's ``key`` that must reach a terminal, non-failed
+    state first. It exists because some repairs are only legal as an ordered pair -- see
+    ``unblock_and_close`` -- and the second half must never be attempted before the first
+    half has actually landed.
     """
 
     key: str
@@ -117,6 +127,7 @@ class WorkItem:
     op: str
     payload: dict[str, Any] = field(default_factory=dict)
     verify: dict[str, Any] = field(default_factory=dict)
+    depends_on: Optional[str] = None
     state: str = PENDING
     attempts: int = 0
     last_error: Optional[str] = None
@@ -152,6 +163,58 @@ class WorkItem:
         return all(issue.get(k) == v for k, v in self.verify.items())
 
 
+def payload_defect(op: str, payload: dict[str, Any]) -> Optional[str]:
+    """Describe why a payload cannot land as a single write, or None if it is fine.
+
+    Observed live on ZIM-1880 (2026-08-07): a ``PATCH`` that both clears the blocker set
+    and moves the status is refused with ``Issue follow-up blocked by unresolved
+    blockers``, because the transition is validated against the *pre-existing* blocker
+    set rather than the set in the same request body. It has to be two ordered writes.
+    """
+    if op != "patch_issue":
+        return None
+    if BLOCKER_FIELD in payload and "status" in payload:
+        return (
+            f"a single PATCH cannot clear {BLOCKER_FIELD} and set status in one request: "
+            "the transition is validated against the pre-existing blocker set. "
+            "Use unblock_and_close() to emit the two ordered writes."
+        )
+    return None
+
+
+def unblock_and_close(target_issue_id: str, target_identifier: str, key_prefix: str,
+                      status: str = "done") -> list[WorkItem]:
+    """The canonical zombie-blocker repair, as the two ordered writes it actually is.
+
+    This is a **2 cap unit** repair, not 1. Planning it as one item under-counts the
+    commonest thing the sweep does: a 10-target zombie pass budgeted at 10 units would
+    attempt 20 writes and, once enforcement is live, silently lose everything past the
+    cap -- the exact half-repaired state this engine exists to prevent.
+
+    Both halves verify against the *final* status, so a target someone else already
+    closed costs no writes at all.
+    """
+    verify = {"status": status}
+    clear = WorkItem(
+        key=f"{key_prefix}:unblock",
+        target_issue_id=target_issue_id,
+        target_identifier=target_identifier,
+        op="patch_issue",
+        payload={BLOCKER_FIELD: []},
+        verify=verify,
+    )
+    close = WorkItem(
+        key=f"{key_prefix}:close",
+        target_issue_id=target_issue_id,
+        target_identifier=target_identifier,
+        op="patch_issue",
+        payload={"status": status},
+        verify=verify,
+        depends_on=clear.key,
+    )
+    return [clear, close]
+
+
 @dataclass
 class SweepState:
     sweep_id: str
@@ -181,6 +244,38 @@ class SweepState:
     @property
     def complete(self) -> bool:
         return all(i.terminal for i in self.items)
+
+    # -- dependencies --------------------------------------------------------------
+
+    def by_key(self, key: str) -> Optional[WorkItem]:
+        for item in self.items:
+            if item.key == key:
+                return item
+        return None
+
+    def pending_dependents(self, key: str) -> list[WorkItem]:
+        """Every still-pending item that transitively waits on ``key``."""
+        out: list[WorkItem] = []
+        frontier = {key}
+        while frontier:
+            nxt: set[str] = set()
+            for item in self.items:
+                if item.terminal or item in out:
+                    continue
+                if item.depends_on in frontier:
+                    out.append(item)
+                    nxt.add(item.key)
+            frontier = nxt
+        return out
+
+    def chain_cost(self, item: WorkItem) -> int:
+        """Cost of applying ``item`` *and* everything still waiting on it.
+
+        Admission is charged against the whole chain so an ordered pair can never be
+        split across a budget boundary. Stopping between "blockers cleared" and "status
+        closed" would leave exactly the half-repaired target this engine promises not to.
+        """
+        return item.cost + sum(d.cost for d in self.pending_dependents(item.key))
 
     def counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -470,12 +565,28 @@ class Sweeper:
             cap=cap,
             reserve=reserve,
         )
+        # Reject writes the platform is known to refuse at plan time rather than
+        # discovering it at the boundary, where it costs an attempt and a round trip.
+        for item in state.items:
+            defect = payload_defect(item.op, item.payload)
+            if defect:
+                raise ValueError(f"{item.target_identifier} ({item.key}): {defect}")
+            if item.depends_on and state.by_key(item.depends_on) is None:
+                raise ValueError(
+                    f"{item.target_identifier} ({item.key}): depends_on "
+                    f"{item.depends_on!r} is not in the worklist"
+                )
         self.save(state, f"plan sweep {sweep_id}: {len(state.items)} intended writes")
         return state
 
     # -- application -------------------------------------------------------------
 
     def _apply_one(self, item: WorkItem) -> None:
+        # Also guarded at plan time; repeated here because a worklist can arrive from a
+        # persisted document written by an older build.
+        defect = payload_defect(item.op, item.payload)
+        if defect:
+            raise WriteRefused(defect)
         if item.op == "patch_issue":
             self.client.patch_issue(item.target_issue_id, item.payload)
         elif item.op == "comment":
@@ -529,21 +640,43 @@ class Sweeper:
                         on_progress(item, SKIPPED)
                     continue
 
+            # Ordered pairs: never attempt the second half before the first has landed.
+            if item.depends_on:
+                prereq = state.by_key(item.depends_on)
+                if prereq is None or prereq.state == FAILED_PERMANENT:
+                    reason = "missing" if prereq is None else "failed"
+                    item.state = FAILED_PERMANENT
+                    item.note = f"prerequisite {item.depends_on} {reason}"
+                    item.last_error = item.note
+                    result.parked += 1
+                    dirty = True
+                    if on_progress:
+                        on_progress(item, FAILED_PERMANENT)
+                    continue
+                if not prereq.terminal:
+                    # Prerequisite is earlier in the list, so it was tried and failed
+                    # transiently this pass. It parks after MAX_ATTEMPTS, so this converges.
+                    continue
+
             # An item costing more than a whole heartbeat's budget can never be applied,
-            # and would otherwise re-trip the gate forever without converging. Park it.
-            if item.cost > budget:
-                item.state = FAILED_PERMANENT
-                item.note = f"item costs {item.cost} cap units, budget is {budget}"
-                item.last_error = item.note
-                result.parked += 1
+            # and would otherwise re-trip the gate forever without converging. Park it,
+            # along with anything waiting on it, which is equally unreachable.
+            chain = state.chain_cost(item)
+            if chain > budget:
+                for doomed in [item] + state.pending_dependents(item.key):
+                    doomed.state = FAILED_PERMANENT
+                    doomed.note = f"chain costs {chain} cap units, budget is {budget}"
+                    doomed.last_error = doomed.note
+                    result.parked += 1
+                    if on_progress:
+                        on_progress(doomed, FAILED_PERMANENT)
                 dirty = True
-                if on_progress:
-                    on_progress(item, FAILED_PERMANENT)
                 continue
 
             # Budget gate: stop *before* the write that would trip the cap, not after.
-            # Charged in cap units, so a patch-plus-comment item needs two free.
-            if result.writes_used + item.cost > budget:
+            # Charged in cap units over the whole dependent chain, so a patch-plus-comment
+            # item needs two free and an unblock-and-close pair needs both halves free.
+            if result.writes_used + chain > budget:
                 result.stopped_for_budget = True
                 break
 
