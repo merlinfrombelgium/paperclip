@@ -19,6 +19,13 @@ function envAssignment(name: string, value: string) {
   return `${name}=${SHELL_ESCAPED_QUOTE}${value}${SHELL_ESCAPED_QUOTE}`;
 }
 
+// ZIM-2114: `paperclip env` reports a secret with no operator between the name
+// and the value, so every separator-anchored rule missed it and the signing
+// secret reached the run logs in clear.
+function doctorReportLine(name: string, value: string) {
+  return `${name} set     [environment] Set in process environment => '${value}'`;
+}
+
 describe("secret redaction on the run-log write path", () => {
   let baseDir: string;
   let previousBasePath: string | undefined;
@@ -62,6 +69,39 @@ describe("secret redaction on the run-log write path", () => {
       const redacted = redactSensitiveText(envAssignment(name, SENTINEL));
       expect(redacted).not.toContain(SENTINEL);
       expect(redacted).toContain(`${name}=`);
+    }
+  });
+
+  it("keeps the doctor/env-report shape out of the persisted chunk record", async () => {
+    const { getRunLogStore } = await import("../services/run-log-store.js");
+    const store = getRunLogStore();
+
+    const handle = await store.begin({
+      companyId: "company-redaction",
+      agentId: "agent-redaction",
+      runId: "run-redaction-doctor",
+    });
+
+    // The same-chunk false-negative trap: a value the redactor already handles
+    // sits beside the one it missed, so the chunk contains a redaction marker
+    // while the signing secret goes through in clear.
+    await store.append(handle, {
+      stream: "stdout",
+      ts: new Date().toISOString(),
+      chunk: `${envAssignment("PAPERCLIP_API_KEY", SENTINEL)}\n${doctorReportLine("PAPERCLIP_AGENT_JWT_SECRET", SENTINEL)}\n`,
+    });
+
+    const persisted = await fs.readFile(path.join(baseDir, handle.logRef), "utf8");
+
+    expect(persisted).not.toContain(SENTINEL);
+    expect(persisted).toContain("PAPERCLIP_AGENT_JWT_SECRET");
+  });
+
+  it("redacts the doctor report shape regardless of the operator used", () => {
+    for (const name of ["PAPERCLIP_AGENT_JWT_SECRET", "GH_TOKEN", "AZURE_FOUNDRY_API_KEY"]) {
+      const redacted = redactSensitiveText(doctorReportLine(name, SENTINEL));
+      expect(redacted).not.toContain(SENTINEL);
+      expect(redacted).toContain(name);
     }
   });
 
