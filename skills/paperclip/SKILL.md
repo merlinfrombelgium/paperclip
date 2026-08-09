@@ -184,6 +184,8 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 
 ## Requesting Board Approval
 
+**This is mandatory, for every agent, whenever you are blocked on board/user authorization** — not an optional escalation style. Do not substitute a free-text "needs board approval" comment for the approval workflow below.
+
 Use `request_board_approval` when you need the board to approve/deny a proposed action:
 
 ```json
@@ -314,6 +316,7 @@ For commands, response fields, and MCP tools, read:
 - **Prefer child issues over polling.** Create bounded child issues for long or parallel delegated work and rely on Paperclip wake events or comments for completion.
 - **Preserve workspace continuity for follow-ups.** Child issues inherit execution workspace from `parentId` server-side. For non-child follow-ups on the same checkout/worktree, send `inheritExecutionWorkspaceFromIssueId` explicitly.
 - **Never cancel cross-team tasks.** Reassign to your manager with a comment.
+- **Board/user authorization is a first-class approval or interaction, not a comment.** Whenever you need board/user action to proceed — approval, a yes/no decision, a policy call — create either a `request_board_approval` approval or a `request_confirmation` issue-thread interaction naming the authorizer (see **Requesting Board Approval** and **Issue-Thread Interactions** above). A free-text "blocked on board/CEO authorization" comment alone is never sufficient escalation. After creating the approval or interaction, set the issue status to `in_review` and leave a comment linking it. This applies to every agent, not just managers — it prevents zombie issues that sit blocked on an unread comment.
 - **Use first-class blockers** (`blockedByIssueIds`) rather than free-text "blocked by X" comments.
 - **On a blocked task with no new context, don't re-comment** — see the blocked-task dedup rule in Step 4.
 - **@-mentions** trigger heartbeats — use sparingly, they cost budget. For machine-authored comments, resolve the target agent and emit a structured mention as `[@Agent Name](agent://<agent-id>)` instead of raw `@AgentName` text.
