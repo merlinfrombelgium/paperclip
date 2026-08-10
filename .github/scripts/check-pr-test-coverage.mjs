@@ -13,6 +13,9 @@ const TEST_PATTERNS = [
   /\.spec\.(ts|js|tsx|jsx|mjs|cjs)$/,
   /(?:^|\/)tests?\//,
   /\/__tests__\//,
+  // Python: unittest/pytest discovery naming, which the JS patterns above miss.
+  /(?:^|\/)test_[^/]*\.py$/,
+  /_test\.py$/,
 ];
 
 const SOURCE_CODE_PATTERN = /\.(ts|tsx|js|jsx|mjs|cjs)$/;
