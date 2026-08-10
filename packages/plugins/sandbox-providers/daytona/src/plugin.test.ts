@@ -1031,8 +1031,23 @@ describe("Daytona sandbox provider plugin", () => {
     expect(command).toMatch(/\/etc\/profile/);
     expect(command).toMatch(/"\$HOME\/\.profile"/);
     expect(command).toMatch(/cd '\/workspace'/);
-    expect(command).toMatch(/&& env FOO='bar' 'printf' 'hello'$/);
+    expect(command).toMatch(/&& 'printf' 'hello'$/);
     expect(command).not.toMatch(/(?:^|&& )exec /);
+    // Env is staged in a file and sourced, never interpolated (ZIM-2084). The
+    // command carries only the path, and the source line lands after profile
+    // sourcing so the caller's env still wins.
+    expect(command).not.toContain("bar");
+    expect(command).toMatch(/&& \. '\/tmp\/paperclip-env-[^']+\/env' && rm -rf '\/tmp\/paperclip-env-[^']+'/);
+    expect(command.indexOf("nvm.sh")).toBeLessThan(command.indexOf("/env'"));
+    expect(sandbox.fs.createFolder).toHaveBeenCalledWith(
+      expect.stringMatching(/^\/tmp\/paperclip-env-/),
+      "700",
+    );
+    expect(sandbox.fs.uploadFile).toHaveBeenCalledWith(
+      Buffer.from("export FOO='bar'\n", "utf8"),
+      expect.stringMatching(/^\/tmp\/paperclip-env-.*\/env$/),
+      1,
+    );
     // cwd/env are baked into the login-shell command itself; we pass undefined
     // to the SDK so it doesn't run the cd before profile sourcing.
     expect(cwdArg).toBeUndefined();
@@ -1044,6 +1059,48 @@ describe("Daytona sandbox provider plugin", () => {
       stdout: "stdout\nstderr\n",
       stderr: "",
     });
+  });
+
+  /**
+   * Regression gate for ZIM-2084 (Class B of ZIM-2069).
+   *
+   * The string handed to `process.executeCommand` becomes the sandbox process's
+   * argv, readable out of `/proc/<pid>/cmdline` by anything else running in that
+   * sandbox, and it transits the Daytona API. No env value may appear in it.
+   *
+   * The assertion is on the *value*, never the key name — the key legitimately
+   * appears in the staged env file.
+   */
+  it("keeps env values out of the command handed to the Daytona SDK", async () => {
+    process.env.DAYTONA_API_KEY = "host-key";
+    const sandbox = createMockSandbox();
+    mockGet.mockResolvedValue(sandbox);
+    const SENTINEL = "sk-zim2084-daytona-sentinel-do-not-leak";
+
+    await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "daytona",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: { timeoutMs: 300000, reuseLease: false },
+      lease: { providerLeaseId: "sandbox-123", metadata: {} },
+      command: "claude",
+      args: ["--print"],
+      cwd: "/workspace",
+      env: { PAPERCLIP_API_KEY: SENTINEL },
+      timeoutMs: 1000,
+    });
+
+    for (const call of sandbox.process.executeCommand.mock.calls) {
+      expect(String(call[0])).not.toContain(SENTINEL);
+    }
+    for (const call of sandbox.fs.createFolder.mock.calls) {
+      expect(String(call[0])).not.toContain(SENTINEL);
+    }
+    // The value still has to reach the sandbox — over the file upload, not argv.
+    const carriers = sandbox.fs.uploadFile.mock.calls.filter((call: unknown[]) =>
+      Buffer.isBuffer(call[0]) && (call[0] as Buffer).toString("utf8").includes(SENTINEL));
+    expect(carriers).toHaveLength(1);
+    expect((carriers[0]![0] as Buffer).toString("utf8")).toBe(`export PAPERCLIP_API_KEY='${SENTINEL}'\n`);
   });
 
   it("stages stdin in the sandbox filesystem when execution needs redirected input", async () => {

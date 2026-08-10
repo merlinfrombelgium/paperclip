@@ -46,6 +46,17 @@ function queueSpawnResult(input: { code?: number; signal?: string | null; stdout
   spawnMock.mockImplementationOnce(() => new MockChildProcess(input));
 }
 
+/**
+ * The env-file writer connection echoes back the remote path it used; the real
+ * remote shell derives it from $TMPDIR, so mirror that here (ZIM-2084).
+ */
+function queueEnvFileWriterResult() {
+  spawnMock.mockImplementationOnce((_file: string, args: string[]) => {
+    const match = args.join(" ").match(/paperclip-env-[0-9a-fA-F-]+/);
+    return new MockChildProcess({ stdout: match ? `/tmp/${match[0]}` : "" });
+  });
+}
+
 describe("exe.dev sandbox provider plugin", () => {
   beforeEach(() => {
     fetchMock.mockReset();
@@ -548,6 +559,7 @@ describe("exe.dev sandbox provider plugin", () => {
   });
 
   it("executes commands over SSH with cwd, env, and stdin", async () => {
+    queueEnvFileWriterResult();
     queueSpawnResult({ code: 0, stdout: "hello\n", stderr: "" });
 
     const result = await plugin.definition.onEnvironmentExecute?.({
@@ -574,11 +586,24 @@ describe("exe.dev sandbox provider plugin", () => {
       timeoutMs: 1000,
     });
 
-    expect(spawnMock).toHaveBeenCalledTimes(1);
-    expect(spawnMock.mock.calls[0]?.[0]).toBe("ssh");
-    expect(String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "")).toContain("/workspace");
-    expect(String(spawnMock.mock.calls[0]?.[1]?.at(-1) ?? "")).toContain("FOO='");
-    const child = spawnMock.mock.results[0]?.value as MockChildProcess;
+    // Two connections now: the env-file writer, then the command itself.
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock.mock.calls[1]?.[0]).toBe("ssh");
+    const remoteCommand = String(spawnMock.mock.calls[1]?.[1]?.at(-1) ?? "");
+    expect(remoteCommand).toContain("/workspace");
+    // Env is staged in a 0600 file and sourced, never interpolated (ZIM-2084).
+    // The remote command carries only the path; the value rides on stdin.
+    expect(remoteCommand).not.toContain("bar");
+    // The remote command is itself nested inside `sh -c '...'`, so the inner
+    // quotes are shell-escaped; match on the path and the delete, not the quoting.
+    const envPath = remoteCommand.match(/\/tmp\/paperclip-env-[0-9a-fA-F-]+/)?.[0];
+    expect(envPath).toBeDefined();
+    expect(remoteCommand).toContain(`. `);
+    expect(remoteCommand).toContain(`rm -f `);
+    expect(remoteCommand.indexOf("nvm.sh")).toBeLessThan(remoteCommand.indexOf(envPath!));
+    const writerChild = spawnMock.mock.results[0]?.value as MockChildProcess;
+    expect(writerChild.stdin.written).toBe("export FOO='bar'\n");
+    const child = spawnMock.mock.results[1]?.value as MockChildProcess;
     expect(child.stdin.written).toBe("input-body");
     expect(child.stdin.ended).toBe(true);
     expect(result).toMatchObject({
@@ -591,6 +616,48 @@ describe("exe.dev sandbox provider plugin", () => {
         vmName: "vm-1",
       },
     });
+  });
+
+  /**
+   * Regression gate for ZIM-2084 (Class B of ZIM-2069).
+   *
+   * The remote command is an argv element of the local `ssh` process. Every
+   * agent on a Paperclip host runs under the same shared uid, so any value that
+   * lands there is readable by every other concurrently running agent with a
+   * single `ps` call. No env value may appear in any spawned argv.
+   *
+   * The assertion is on the *value*, never the key name — the key legitimately
+   * appears in the staged env file.
+   */
+  it("keeps env values out of every ssh argv", async () => {
+    queueEnvFileWriterResult();
+    queueSpawnResult({ code: 0, stdout: "hello\n", stderr: "" });
+    const SENTINEL = "sk-zim2084-exedev-sentinel-do-not-leak";
+
+    await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "exe-dev",
+      companyId: "company-1",
+      environmentId: "env-1",
+      config: { apiKey: "api-key", timeoutMs: 300000 },
+      lease: { providerLeaseId: "vm-1", metadata: { sshDest: "vm-1.exe.xyz" } },
+      command: "claude",
+      args: ["--print"],
+      cwd: "/workspace",
+      env: { PAPERCLIP_API_KEY: SENTINEL },
+      timeoutMs: 1000,
+    });
+
+    for (const call of spawnMock.mock.calls) {
+      for (const entry of [call[0], ...(call[1] ?? [])]) {
+        expect(String(entry)).not.toContain(SENTINEL);
+      }
+    }
+    // The value still has to reach the VM — over the ssh channel on stdin.
+    const carriers = spawnMock.mock.results
+      .map((r) => r.value as MockChildProcess)
+      .filter((child) => child.stdin.written.includes(SENTINEL));
+    expect(carriers).toHaveLength(1);
+    expect(carriers[0]!.stdin.written).toBe(`export PAPERCLIP_API_KEY='${SENTINEL}'\n`);
   });
 
   it("returns exe.dev SSH onboarding guidance for command execution failures", async () => {

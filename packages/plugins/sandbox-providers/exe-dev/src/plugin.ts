@@ -518,25 +518,41 @@ async function prepareSshIdentity(config: ExeDevDriverConfig): Promise<{
   };
 }
 
-function buildLoginShellScript(input: {
-  command: string;
-  args: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-}): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
+/**
+ * Env delivery for exe.dev VM execs.
+ *
+ * Values must never be interpolated into the remote command. The command is an
+ * argv element of the local `ssh` process, so on a Paperclip host — where every
+ * agent runs under the same shared uid — any other agent can read it out of
+ * `/proc/<pid>/cmdline` with a single `ps` call, and it lands in the VM's argv
+ * as well (ZIM-2069). Instead the values travel over the encrypted ssh channel
+ * on stdin into a 0600 file, and argv carries only the non-secret path.
+ *
+ * This is the same shape as `writeRemoteEnvFile` in
+ * `packages/adapter-utils/src/ssh.ts` (ZIM-2082), reimplemented here because
+ * this plugin owns its own `ssh` invocation and does not depend on
+ * adapter-utils.
+ */
+function selectEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  const entries = env ?? {};
+  for (const key of Object.keys(entries)) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid exe.dev environment variable key: ${key}`);
     }
   }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  return Object.entries(entries).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+}
+
+function buildLoginShellScript(input: {
+  command: string;
+  args: string[];
+  cwd?: string;
+  envFilePath?: string;
+}): string {
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
-  const finalLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}`
-    : `exec ${commandParts}`;
+  const finalLine = `exec ${commandParts}`;
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -545,6 +561,12 @@ function buildLoginShellScript(input: {
     'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
     '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
   ];
+  // Sourced after profile init so the caller's env still wins over anything the
+  // profile exports, and deleted immediately so it does not outlive the command.
+  if (input.envFilePath) {
+    const quotedEnvFile = shellQuote(input.envFilePath);
+    lines.push(`. ${quotedEnvFile} && rm -f ${quotedEnvFile}`);
+  }
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
@@ -637,6 +659,55 @@ async function runSshCommand(
   } finally {
     await identity.cleanup();
   }
+}
+
+/**
+ * Stage the env values in a 0600 file on the VM and return its path.
+ *
+ * `umask 077` precedes the redirect so the file is never briefly world
+ * readable; the explicit `chmod` covers shells that ignore umask on an existing
+ * inode. The remote shell resolves TMPDIR and echoes back the path it actually
+ * used, so the consuming command does not have to re-derive it. The payload
+ * rides in on stdin — this connection sends no other stdin, so it cannot
+ * collide with a caller-supplied payload.
+ */
+async function writeRemoteEnvFile(
+  config: ExeDevDriverConfig,
+  vm: ExeDevVmRecord,
+  envEntries: Array<[string, string]>,
+  timeoutMs: number,
+): Promise<string> {
+  const fileName = `paperclip-env-${randomUUID()}`;
+  const writerScript = [
+    "umask 077",
+    'dir="${TMPDIR:-/tmp}"',
+    `file="$dir/${fileName}"`,
+    'cat > "$file"',
+    'chmod 600 "$file"',
+    'printf %s "$file"',
+  ].join(" && ");
+  const payload = `${envEntries.map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n")}\n`;
+
+  const result = await runSshCommand(config, vm, `sh -c ${shellQuote(writerScript)}`, {
+    stdin: payload,
+    timeoutMs,
+  });
+  const remotePath = result.stdout.trim();
+  if (result.exitCode !== 0 || !remotePath.startsWith("/") || !remotePath.endsWith(fileName)) {
+    throw new Error(`Failed to stage the environment file on exe.dev VM ${vm.name}.`);
+  }
+  return remotePath;
+}
+
+/** Best-effort cleanup for the case where the consuming command never ran. */
+async function removeRemoteEnvFile(
+  config: ExeDevDriverConfig,
+  vm: ExeDevVmRecord,
+  remotePath: string,
+): Promise<void> {
+  await runSshCommand(config, vm, `sh -c ${shellQuote(`rm -f ${shellQuote(remotePath)}`)}`, {
+    timeoutMs: 10_000,
+  }).catch(() => undefined);
 }
 
 async function detectRemoteContext(
@@ -923,40 +994,58 @@ const plugin = definePlugin({
       };
     }
 
-    const command = buildLoginShellScript({
-      command: params.command,
-      args: params.args ?? [],
-      cwd: params.cwd ?? parseOptionalString(params.lease.metadata?.remoteCwd) ?? undefined,
-      env: params.env,
-    });
-    // `buildLoginShellScript` already explicitly sources `/etc/profile`,
-    // `~/.profile`, `~/.bash_profile`/`~/.bashrc`, and `~/.zprofile`. Wrapping
-    // the result in `sh -lc` (login shell) would source the same files a
-    // second time, which can cause `PATH` duplication or unexpected behavior
-    // on VMs whose profile init isn't idempotent. Use `sh -c` here so the
-    // explicit sourcing inside the script is the single source of truth.
-    const result = await runSshCommand(
-      config,
-      vm,
-      `sh -c ${shellQuote(command)}`,
-      { stdin: params.stdin, timeoutMs: params.timeoutMs ?? config.timeoutMs },
-    );
+    const timeoutMs = params.timeoutMs ?? config.timeoutMs;
+    // Key validation happens before anything is staged so an invalid key still
+    // fails the call rather than leaving an orphaned env file on the VM.
+    const envEntries = selectEnvEntries(params.env);
+    const envFilePath = envEntries.length > 0
+      ? await writeRemoteEnvFile(config, vm, envEntries, timeoutMs)
+      : null;
 
-    return {
-      exitCode: result.exitCode,
-      signal: result.signal,
-      timedOut: result.timedOut,
-      stdout: result.stdout,
-      stderr:
-        !result.timedOut && result.exitCode !== 0
-          ? formatSshFailure("execute commands on", vm.name, result)
-          : result.stderr,
-      metadata: {
-        provider: "exe-dev",
-        vmName: vm.name,
-        sshDest: vm.sshDest,
-      },
-    };
+    let sourced = false;
+    try {
+      const command = buildLoginShellScript({
+        command: params.command,
+        args: params.args ?? [],
+        cwd: params.cwd ?? parseOptionalString(params.lease.metadata?.remoteCwd) ?? undefined,
+        envFilePath: envFilePath ?? undefined,
+      });
+      // `buildLoginShellScript` already explicitly sources `/etc/profile`,
+      // `~/.profile`, `~/.bash_profile`/`~/.bashrc`, and `~/.zprofile`. Wrapping
+      // the result in `sh -lc` (login shell) would source the same files a
+      // second time, which can cause `PATH` duplication or unexpected behavior
+      // on VMs whose profile init isn't idempotent. Use `sh -c` here so the
+      // explicit sourcing inside the script is the single source of truth.
+      const result = await runSshCommand(
+        config,
+        vm,
+        `sh -c ${shellQuote(command)}`,
+        { stdin: params.stdin, timeoutMs },
+      );
+      // The script deletes the env file itself once it reaches the source line,
+      // which it does unless the connection failed outright.
+      sourced = !result.timedOut;
+
+      return {
+        exitCode: result.exitCode,
+        signal: result.signal,
+        timedOut: result.timedOut,
+        stdout: result.stdout,
+        stderr:
+          !result.timedOut && result.exitCode !== 0
+            ? formatSshFailure("execute commands on", vm.name, result)
+            : result.stderr,
+        metadata: {
+          provider: "exe-dev",
+          vmName: vm.name,
+          sshDest: vm.sshDest,
+        },
+      };
+    } finally {
+      if (envFilePath && !sourced) {
+        await removeRemoteEnvFile(config, vm, envFilePath);
+      }
+    }
   },
 });
 

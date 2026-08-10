@@ -26,23 +26,44 @@ function randomToken(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-export function buildLoginShellScript(input: {
-  command: string;
-  args: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  stdinFile?: string | null;
-}): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
+/**
+ * Env delivery for bridge execs.
+ *
+ * Values must never be interpolated into the script. The script is passed to
+ * the sandbox's `exec()` as a command string, so it becomes the container
+ * process's argv — readable out of `/proc/<pid>/cmdline` by anything already
+ * running in that sandbox (ZIM-2085). Instead the values are written to a file
+ * inside a 0700 directory via `sandbox.writeFile` and the script sources that
+ * file and deletes it; only the non-secret path appears in argv.
+ *
+ * This mirrors `writeRemoteEnvFile` in `packages/adapter-utils/src/ssh.ts`
+ * (ZIM-2082). Residual risk, accepted: the file is readable by the sandbox user
+ * itself for the life of the command.
+ */
+export function selectEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  const entries = env ?? {};
+  for (const key of Object.keys(entries)) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
+  return Object.entries(entries).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+}
 
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+/** The bytes written into the sandbox. The only place a value appears. */
+export function buildEnvFilePayload(entries: Array<[string, string]>): string {
+  return `${entries.map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n")}\n`;
+}
+
+export function buildLoginShellScript(input: {
+  command: string;
+  args: string[];
+  cwd?: string;
+  envFileDir?: string | null;
+  stdinFile?: string | null;
+}): string {
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
   const stdinRedirect = input.stdinFile ? ` < ${shellQuote(input.stdinFile)}` : "";
   const lines = [
@@ -53,13 +74,18 @@ export function buildLoginShellScript(input: {
     'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
     '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
   ];
+  // Sourced after profile init so the caller's env still wins over anything the
+  // profile exports, and the whole staging directory is removed immediately so
+  // it does not outlive the command.
+  if (input.envFileDir) {
+    lines.push(
+      `. ${shellQuote(`${input.envFileDir}/env`)} && rm -rf ${shellQuote(input.envFileDir)}`,
+    );
+  }
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
-  const execLine = envArgs.length > 0
-    ? `exec env ${envArgs.join(" ")} ${commandParts}${stdinRedirect}`
-    : `exec ${commandParts}${stdinRedirect}`;
-  lines.push(execLine);
+  lines.push(`exec ${commandParts}${stdinRedirect}`);
   return lines.join(" && ");
 }
 
@@ -97,6 +123,25 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
     await params.sandbox.writeFile(stdinFile, stdinPayload, { encoding: "utf8" });
   }
 
+  // Key validation happens before anything is staged so an invalid key still
+  // fails the call rather than leaving an orphaned env file behind.
+  const envEntries = selectEnvEntries(params.env);
+  const envFileDir = envEntries.length > 0 ? `/tmp/.paperclip-bridge-env-${randomToken()}` : null;
+  const envFilePath = envFileDir ? `${envFileDir}/env` : null;
+
+  if (envFileDir && envFilePath) {
+    // `writeFile` creates intermediate directories but gives no control over
+    // their mode, so tighten the directory before the value lands inside it.
+    const stageDir = `umask 077 && mkdir -p ${shellQuote(envFileDir)} && chmod 700 ${shellQuote(envFileDir)}`;
+    await params.sandbox.exec(`sh -c ${shellQuote(stageDir)}`);
+    await params.sandbox.writeFile(envFilePath, buildEnvFilePayload(envEntries), { encoding: "utf8" });
+  }
+
+  // The script removes the staging directory itself once it reaches the source
+  // line; the finally-block cleanup is only for the case where the command
+  // never got that far.
+  let sourced = false;
+
   try {
     const target = await resolveExecutionTarget(params.sandbox, {
       sessionStrategy: params.sessionStrategy,
@@ -109,7 +154,7 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
       command: params.command,
       args: params.args ?? [],
       cwd: params.cwd,
-      env: params.env,
+      envFileDir,
       stdinFile,
     });
     const fullCommand = `sh -lc ${shellQuote(script)}`;
@@ -123,6 +168,7 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
           }
         : {}),
     });
+    sourced = true;
     return coerceExecuteResult(result);
   } catch (error) {
     if (isTimeoutError(error)) {
@@ -142,6 +188,10 @@ export async function executeInSandbox(params: BridgeExecuteParams) {
   } finally {
     if (stdinFile) {
       await params.sandbox.deleteFile?.(stdinFile).catch(() => undefined);
+    }
+    if (envFileDir && !sourced) {
+      await Promise.resolve(params.sandbox.exec(`sh -c ${shellQuote(`rm -rf ${shellQuote(envFileDir)}`)}`))
+        .catch(() => undefined);
     }
   }
 }
