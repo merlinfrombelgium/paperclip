@@ -543,12 +543,16 @@ describe("Modal sandbox provider plugin", () => {
 
   it("executes commands with a login-shell wrapper that injects env after profile sourcing", async () => {
     const sandbox = createFakeSandbox({
+      // The env-file staging exec has to succeed; only the user command carries
+      // the non-zero exit this test asserts on.
       execImpl: async (argv: string[]) =>
-        makeFakeProcess({
-          exitCode: 5,
-          stdout: "stdout-output",
-          stderr: "stderr-output",
-        }),
+        argv[2]?.startsWith("umask 077 &&")
+          ? makeFakeProcess({ exitCode: 0, stdout: "", stderr: "" })
+          : makeFakeProcess({
+              exitCode: 5,
+              stdout: "stdout-output",
+              stderr: "stderr-output",
+            }),
     });
     mockSandboxesFromId.mockResolvedValue(sandbox);
 
@@ -565,14 +569,28 @@ describe("Modal sandbox provider plugin", () => {
       timeoutMs: 12_000,
     });
 
-    expect(sandbox.execCalls).toHaveLength(1);
-    const call = sandbox.execCalls[0]!;
+    // Two execs now: the env-file staging exec, then the command itself.
+    expect(sandbox.execCalls).toHaveLength(2);
+    const stagingCall = sandbox.execCalls[0]!;
+    expect(stagingCall.argv[2]).toMatch(
+      /^umask 077 && mkdir -p '\/tmp\/paperclip-env-[^']+' && chmod 700 '\/tmp\/paperclip-env-[^']+'$/,
+    );
+    const call = sandbox.execCalls[1]!;
     expect(call.argv[0]).toBe("sh");
     expect(call.argv[1]).toBe("-lc");
     const script = call.argv[2]!;
     expect(script).toMatch(/\/etc\/profile/);
     expect(script).toMatch(/cd '\/srv\/work'/);
-    expect(script).toMatch(/&& exec env FOO='bar' 'printf' 'hello'$/);
+    expect(script).toMatch(/&& exec 'printf' 'hello'$/);
+    // Env is staged in a file and sourced, never interpolated (ZIM-2084). The
+    // script carries only the path, and the source line lands after profile
+    // sourcing so the caller's env still wins.
+    expect(script).not.toContain("bar");
+    expect(script).toMatch(/&& \. '\/tmp\/paperclip-env-[^']+\/env' && rm -rf '\/tmp\/paperclip-env-[^']+'/);
+    expect(script.indexOf("nvm.sh")).toBeLessThan(script.indexOf("/env'"));
+    const envFile = sandbox.openedFiles.find((file) => file.path.endsWith("/env"));
+    expect(envFile?.mode).toBe("w");
+    expect(new TextDecoder().decode(envFile?.written ?? new Uint8Array())).toBe("export FOO='bar'\n");
     expect(call.params).toMatchObject({
       timeoutMs: 12_000,
       stdout: "pipe",
@@ -584,6 +602,49 @@ describe("Modal sandbox provider plugin", () => {
       stdout: "stdout-output",
       stderr: "stderr-output",
     });
+  });
+
+  /**
+   * Regression gate for ZIM-2084 (Class B of ZIM-2069).
+   *
+   * The script is an element of the `sh -lc` argv handed to `sandbox.exec`, so
+   * it becomes the sandbox process's argv — readable out of `/proc/<pid>/cmdline`
+   * by anything else running in that sandbox — and it transits the Modal API.
+   * No env value may appear in any exec argv.
+   *
+   * The assertion is on the *value*, never the key name — the key legitimately
+   * appears in the staged env file.
+   */
+  it("keeps env values out of every argv handed to the Modal SDK", async () => {
+    const sandbox = createFakeSandbox();
+    mockSandboxesFromId.mockResolvedValue(sandbox);
+    const SENTINEL = "sk-zim2084-modal-sentinel-do-not-leak";
+
+    await plugin.definition.onEnvironmentExecute?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      config: baseConfig,
+      lease: { providerLeaseId: "sb-exec", metadata: {} },
+      command: "claude",
+      args: ["--print"],
+      cwd: "/srv/work",
+      env: { PAPERCLIP_API_KEY: SENTINEL },
+      timeoutMs: 12_000,
+    });
+
+    for (const call of sandbox.execCalls) {
+      for (const entry of call.argv) {
+        expect(entry).not.toContain(SENTINEL);
+      }
+    }
+    // The value still has to reach the sandbox — over the file write, not argv.
+    const carriers = sandbox.openedFiles.filter((file) =>
+      new TextDecoder().decode(file.written ?? new Uint8Array()).includes(SENTINEL));
+    expect(carriers).toHaveLength(1);
+    expect(new TextDecoder().decode(carriers[0]!.written!)).toBe(
+      `export PAPERCLIP_API_KEY='${SENTINEL}'\n`,
+    );
   });
 
   it("stages stdin in the sandbox filesystem when execution needs redirected input", async () => {

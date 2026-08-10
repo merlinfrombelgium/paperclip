@@ -211,34 +211,57 @@ function isValidShellEnvKey(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
-// Modal's `sandbox.exec` takes an argv array and bypasses the shell entirely,
-// so adapter probes that rely on PATH mutations from /etc/profile or ~/.bashrc
-// do not work without an explicit login shell. Mirroring the Daytona / E2B
-// providers, wrap the user command in a `sh -lc` script that sources common
-// login profiles plus nvm before invoking it. Env is set after profile sourcing
-// so caller env wins; stdin is staged to a temp file and shell-redirected so
-// fast-failing commands do not race a streaming stdin writer.
-function buildLoginShellScript(input: {
-  command: string;
-  args: string[];
-  cwd?: string;
-  env?: Record<string, string>;
-  stdinPath?: string;
-}): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
+/**
+ * Env delivery for Modal execs.
+ *
+ * Values must never be interpolated into the script. The script is an element
+ * of the `sh -lc` argv handed to `sandbox.exec`, so it becomes the sandbox
+ * process's argv — readable out of `/proc/<pid>/cmdline` by anything already
+ * running in that sandbox — and it transits the Modal API where it may be
+ * retained in provider request logs (ZIM-2085). Instead the values are written
+ * into a file inside a 0700 directory via the filesystem API and the script
+ * sources that file and deletes it; only the non-secret path appears in argv.
+ *
+ * This mirrors `writeRemoteEnvFile` in `packages/adapter-utils/src/ssh.ts`
+ * (ZIM-2082). Residual risk, accepted: the file is readable by the sandbox user
+ * itself for the life of the command.
+ */
+function selectEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  const entries = env ?? {};
+  for (const key of Object.keys(entries)) {
     if (!isValidShellEnvKey(key)) {
       throw new Error(`Invalid sandbox environment variable key: ${key}`);
     }
   }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
+  return Object.entries(entries).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+}
+
+/** The bytes written into the sandbox. The only place a value appears. */
+function buildEnvFilePayload(entries: Array<[string, string]>): string {
+  return `${entries.map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n")}\n`;
+}
+
+// Modal's `sandbox.exec` takes an argv array and bypasses the shell entirely,
+// so adapter probes that rely on PATH mutations from /etc/profile or ~/.bashrc
+// do not work without an explicit login shell. Mirroring the Daytona / E2B
+// providers, wrap the user command in a `sh -lc` script that sources common
+// login profiles plus nvm before invoking it. Env is sourced after profile
+// sourcing so caller env wins; stdin is staged to a temp file and
+// shell-redirected so fast-failing commands do not race a streaming stdin writer.
+function buildLoginShellScript(input: {
+  command: string;
+  args: string[];
+  cwd?: string;
+  envFileDir?: string;
+  stdinPath?: string;
+}): string {
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
   const redirected = input.stdinPath
     ? `${commandParts} < ${shellQuote(input.stdinPath)}`
     : commandParts;
-  const finalLine = envArgs.length > 0 ? `exec env ${envArgs.join(" ")} ${redirected}` : `exec ${redirected}`;
+  const finalLine = `exec ${redirected}`;
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -247,6 +270,13 @@ function buildLoginShellScript(input: {
     'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
     '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
   ];
+  // Sourced after profile init so the caller's env still wins over anything the
+  // profile exports, and the whole staging directory is removed immediately so
+  // it does not outlive the command (and so the happy path needs no extra exec).
+  if (input.envFileDir) {
+    const quotedDir = shellQuote(input.envFileDir);
+    lines.push(`. ${shellQuote(`${input.envFileDir}/env`)} && rm -rf ${quotedDir}`);
+  }
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
@@ -274,6 +304,47 @@ async function stageStdin(sandbox: Sandbox, stdin: string, remotePath: string): 
     await file.flush();
   } finally {
     await file.close().catch(() => undefined);
+  }
+}
+
+/**
+ * Create the 0700 directory that will hold the env file, then write the file
+ * into it. `sandbox.open` has no mode argument, so the directory carries the
+ * mode; `umask 077` covers the file itself. Only the directory path — which is
+ * a random, non-secret name — appears in this exec's argv.
+ */
+async function stageEnvFile(
+  sandbox: Sandbox,
+  envFileDir: string,
+  envFilePath: string,
+  payload: string,
+): Promise<void> {
+  const proc = await sandbox.exec([
+    "sh",
+    "-lc",
+    `umask 077 && mkdir -p ${shellQuote(envFileDir)} && chmod 700 ${shellQuote(envFileDir)}`,
+  ]);
+  const exitCode = await proc.wait();
+  if (exitCode !== 0) {
+    throw new Error(`Failed to stage the sandbox environment file: mkdir exited with code ${exitCode}`);
+  }
+  const file = await sandbox.open(envFilePath, "w");
+  try {
+    await file.write(new TextEncoder().encode(payload));
+    await file.flush();
+  } finally {
+    await file.close().catch(() => undefined);
+  }
+}
+
+/** Best-effort removal of the staged env directory, for the case where the
+ * consuming command never ran and so never sourced-and-deleted the file. */
+async function deleteEnvFileDir(sandbox: Sandbox, envFileDir: string): Promise<void> {
+  try {
+    const proc = await sandbox.exec(["sh", "-lc", `rm -rf ${shellQuote(envFileDir)}`]);
+    await proc.wait();
+  } catch {
+    // ignore
   }
 }
 
@@ -613,15 +684,29 @@ const plugin = definePlugin({
       const stdinPath = params.stdin != null
         ? `/tmp/paperclip-stdin-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
         : null;
+      // Key validation happens before anything is staged so an invalid key
+      // still fails the call rather than leaving an orphaned env file behind.
+      const envEntries = selectEnvEntries(params.env);
+      const envFileDir = envEntries.length > 0
+        ? `/tmp/paperclip-env-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+        : null;
+      const envFilePath = envFileDir ? `${envFileDir}/env` : null;
+      // The script removes the staging directory itself once it reaches the
+      // source line; the finally-block cleanup is only for the case where the
+      // command never got that far.
+      let sourced = false;
       try {
         if (stdinPath && params.stdin != null) {
           await stageStdin(sandbox, params.stdin, stdinPath);
+        }
+        if (envFileDir && envFilePath) {
+          await stageEnvFile(sandbox, envFileDir, envFilePath, buildEnvFilePayload(envEntries));
         }
         const script = buildLoginShellScript({
           command: params.command,
           args: params.args ?? [],
           cwd: params.cwd ?? config.workdir,
-          env: params.env,
+          envFileDir: envFileDir ?? undefined,
           stdinPath: stdinPath ?? undefined,
         });
         const proc = await sandbox.exec(["sh", "-lc", script], {
@@ -630,6 +715,7 @@ const plugin = definePlugin({
           stderr: "pipe",
         });
         const { stdout, stderr, exitCode } = await readProcessStreams(proc);
+        sourced = true;
         return {
           exitCode,
           timedOut: false,
@@ -649,6 +735,9 @@ const plugin = definePlugin({
       } finally {
         if (stdinPath) {
           await deleteStdinPath(sandbox, stdinPath);
+        }
+        if (envFileDir && !sourced) {
+          await deleteEnvFileDir(sandbox, envFileDir);
         }
       }
     } finally {

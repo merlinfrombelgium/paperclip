@@ -558,6 +558,46 @@ function isValidShellEnvKey(value: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+/**
+ * Env delivery for Daytona one-shot execs.
+ *
+ * Values must never be interpolated into the command string. The string handed
+ * to `process.executeCommand` becomes the sandbox process's argv, readable out
+ * of `/proc/<pid>/cmdline` by anything already running in that sandbox, and it
+ * transits the Daytona API where it may be retained in provider request logs
+ * (ZIM-2085). Instead the values are uploaded to a file inside a 0700 directory
+ * and the script sources that file and deletes it; only the non-secret path
+ * ever appears in argv.
+ *
+ * The containing directory carries the mode because `fs.uploadFile` has no mode
+ * argument — a 0700 directory keeps the file unreadable by other uids for the
+ * short window before it is sourced and removed. This mirrors
+ * `writeRemoteEnvFile` in `packages/adapter-utils/src/ssh.ts` (ZIM-2082).
+ *
+ * Residual risk, accepted: the file is readable by the sandbox user itself for
+ * the life of the command. That is inherent to handing the process its env at
+ * all; the gain is keeping values out of provider logs and sibling-process argv.
+ */
+const ENV_FILE_DIR_MODE = "700";
+
+/** The env entries worth delivering, with keys validated as shell identifiers. */
+function selectEnvEntries(env: Record<string, string> | undefined): Array<[string, string]> {
+  const entries = env ?? {};
+  for (const key of Object.keys(entries)) {
+    if (!isValidShellEnvKey(key)) {
+      throw new Error(`Invalid sandbox environment variable key: ${key}`);
+    }
+  }
+  return Object.entries(entries).filter(
+    (entry): entry is [string, string] => typeof entry[1] === "string",
+  );
+}
+
+/** The bytes uploaded into the sandbox. The only place a value appears. */
+function buildEnvFilePayload(entries: Array<[string, string]>): string {
+  return `${entries.map(([key, value]) => `export ${key}=${shellQuote(value)}`).join("\n")}\n`;
+}
+
 // Mirror the E2B sandbox executor: source common login profiles (and nvm)
 // before running the command so Daytona one-shot calls see the same PATH an
 // interactive shell would. Without this, adapter probes can fail to resolve
@@ -567,29 +607,17 @@ function buildLoginShellScript(input: {
   command: string;
   args: string[];
   cwd?: string;
-  env?: Record<string, string>;
+  envFileDir?: string;
   stdinPath?: string;
 }): string {
-  const env = input.env ?? {};
-  for (const key of Object.keys(env)) {
-    if (!isValidShellEnvKey(key)) {
-      throw new Error(`Invalid sandbox environment variable key: ${key}`);
-    }
-  }
-  const envArgs = Object.entries(env)
-    .filter((entry): entry is [string, string] => typeof entry[1] === "string")
-    .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const commandParts = [shellQuote(input.command), ...input.args.map(shellQuote)].join(" ");
   const redirectedCommand = input.stdinPath
     ? `${commandParts} < ${shellQuote(input.stdinPath)}`
     : commandParts;
   // Each `executeCommand` call runs in its own shell, so we don't `exec`-
   // replace it; running the command as the last `&&`-chained line is enough to
-  // surface the right exit code. Env is interpolated after profile sourcing so
-  // the caller's env wins over any defaults the profile exports.
-  const finalLine = envArgs.length > 0
-    ? `env ${envArgs.join(" ")} ${redirectedCommand}`
-    : redirectedCommand;
+  // surface the right exit code.
+  const finalLine = redirectedCommand;
   const lines = [
     'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
@@ -600,6 +628,14 @@ function buildLoginShellScript(input: {
     'export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"',
     '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1 || true',
   ];
+  // Sourced after profile init so the caller's env still wins over anything the
+  // profile exports, and the whole staging directory is removed immediately so
+  // it does not outlive the command.
+  if (input.envFileDir) {
+    lines.push(
+      `. ${shellQuote(`${input.envFileDir}/env`)} && rm -rf ${shellQuote(input.envFileDir)}`,
+    );
+  }
   if (input.cwd) {
     lines.push(`cd ${shellQuote(input.cwd)}`);
   }
@@ -666,17 +702,35 @@ async function executeOneShot(
   const timeoutMs = resolveTimeoutMs(params.timeoutMs, config);
   const timeoutSeconds = toTimeoutSeconds(timeoutMs);
   const stdinPath = params.stdin != null ? `/tmp/paperclip-stdin-${randomUUID()}` : null;
+  // Key validation happens before anything is staged so an invalid key still
+  // fails the call rather than leaving an orphaned env file behind.
+  const envEntries = selectEnvEntries(params.env);
+  const envFileDir = envEntries.length > 0 ? `/tmp/paperclip-env-${randomUUID()}` : null;
+  const envFilePath = envFileDir ? `${envFileDir}/env` : null;
+  // The script removes the staging directory itself once it reaches the source
+  // line; the finally-block cleanup is only for the case where the command
+  // never got that far.
+  let sourced = false;
 
   try {
     if (stdinPath) {
       await sandbox.fs.uploadFile(Buffer.from(params.stdin ?? "", "utf8"), stdinPath, timeoutSeconds);
     }
 
+    if (envFileDir && envFilePath) {
+      await sandbox.fs.createFolder(envFileDir, ENV_FILE_DIR_MODE);
+      await sandbox.fs.uploadFile(
+        Buffer.from(buildEnvFilePayload(envEntries), "utf8"),
+        envFilePath,
+        timeoutSeconds,
+      );
+    }
+
     const command = buildLoginShellScript({
       command: params.command,
       args: params.args ?? [],
       cwd: params.cwd,
-      env: params.env,
+      envFileDir: envFileDir ?? undefined,
       stdinPath: stdinPath ?? undefined,
     });
 
@@ -685,6 +739,7 @@ async function executeOneShot(
     // cwd argument runs before our login-shell init, which is the wrong order
     // (env from .bashrc would override caller env).
     const result = await sandbox.process.executeCommand(command, undefined, undefined, timeoutSeconds);
+    sourced = true;
 
     return {
       exitCode: typeof result.exitCode === "number" ? result.exitCode : 1,
@@ -705,6 +760,9 @@ async function executeOneShot(
   } finally {
     if (stdinPath) {
       await sandbox.fs.deleteFile(stdinPath).catch(() => undefined);
+    }
+    if (envFilePath && !sourced) {
+      await sandbox.fs.deleteFile(envFilePath).catch(() => undefined);
     }
   }
 }
