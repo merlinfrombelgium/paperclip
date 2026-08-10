@@ -107,3 +107,23 @@ test('requires test when no prefix used', () => {
 test('handles scoped prefix like fix(server):', () => {
   assert.equal(checkTestCoverage(makeFiles(['src/foo.test.ts', 'src/foo.ts']), 'fix(server): bug').passed, true);
 });
+
+test('recognises Python unittest/pytest test files', () => {
+  const result = checkTestCoverage(
+    makeFiles(['skills/paperclip/scripts/board_doctor_sweep.py', 'skills/paperclip/scripts/test_board_doctor_sweep.py']),
+    'feat: python sweep engine'
+  );
+  assert.equal(result.passed, true);
+});
+
+test('recognises the *_test.py naming variant', () => {
+  assert.equal(checkTestCoverage(makeFiles(['pkg/thing.py', 'pkg/thing_test.py']), 'feat: thing').passed, true);
+});
+
+test('a Python PR with no test file is still flagged', () => {
+  assert.equal(checkTestCoverage(makeFiles(['pkg/thing.py']), 'feat: thing').passed, false);
+});
+
+test('does not mistake a non-test .py file for a test', () => {
+  assert.equal(checkTestCoverage(makeFiles(['pkg/latest_run.py']), 'feat: thing').passed, false);
+});
